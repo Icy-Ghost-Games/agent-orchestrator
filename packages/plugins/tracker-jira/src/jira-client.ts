@@ -20,7 +20,10 @@ export interface JiraIssue {
   fields: {
     summary: string;
     description: AdfNode | null;
-    status: { name: string };
+    status: {
+      name: string;
+      statusCategory?: { key?: string; name?: string };
+    };
     priority?: { name: string } | null;
     labels: string[];
     assignee?: { displayName: string; accountId: string } | null;

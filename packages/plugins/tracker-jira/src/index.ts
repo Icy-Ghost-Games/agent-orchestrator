@@ -56,11 +56,34 @@ function getIssueType(project: ProjectConfig): string {
 // Jira → AO mapping
 // ---------------------------------------------------------------------------
 
-function mapState(jiraStatus: string): Issue["state"] {
+function mapState(
+  jiraStatus: string,
+  statusCategoryKey?: string,
+): Issue["state"] {
   const lower = jiraStatus.toLowerCase();
+  // Name-based overrides — cancelled/rejected are still "done" in Jira's
+  // statusCategory but we want to surface them as "cancelled" in AO.
+  if (
+    lower === "cancelled" ||
+    lower === "canceled" ||
+    lower === "rejected" ||
+    lower === "dismissed" ||
+    lower === "won't do" ||
+    lower === "wont do" ||
+    lower === "will not do"
+  ) {
+    return "cancelled";
+  }
+  // Prefer Jira's statusCategory — canonical across custom workflows.
+  if (statusCategoryKey) {
+    const cat = statusCategoryKey.toLowerCase();
+    if (cat === "done") return "closed";
+    if (cat === "indeterminate") return "in_progress";
+    if (cat === "new" || cat === "undefined") return "open";
+  }
+  // Fall back to name-based matching for workflows without statusCategory.
   if (lower === "done" || lower === "closed" || lower === "resolved") return "closed";
   if (lower === "in progress" || lower === "in review") return "in_progress";
-  if (lower === "cancelled" || lower === "canceled" || lower === "rejected") return "cancelled";
   return "open";
 }
 
@@ -70,7 +93,10 @@ function mapIssue(issue: JiraIssue, baseUrl: string): Issue {
     title: issue.fields.summary,
     description: adfToMarkdown(issue.fields.description),
     url: `${baseUrl.replace(/\/+$/, "")}/browse/${issue.key}`,
-    state: mapState(issue.fields.status.name),
+    state: mapState(
+      issue.fields.status.name,
+      issue.fields.status.statusCategory?.key,
+    ),
     labels: issue.fields.labels ?? [],
     assignee: issue.fields.assignee?.displayName,
     priority: mapPriority(issue.fields.priority?.name),
@@ -158,7 +184,10 @@ export function create(): Tracker {
     async isCompleted(identifier: string, project: ProjectConfig): Promise<boolean> {
       const client = getClient(project);
       const issue = await client.getIssue(identifier);
-      const state = mapState(issue.fields.status.name);
+      const state = mapState(
+        issue.fields.status.name,
+        issue.fields.status.statusCategory?.key,
+      );
       return state === "closed" || state === "cancelled";
     },
 

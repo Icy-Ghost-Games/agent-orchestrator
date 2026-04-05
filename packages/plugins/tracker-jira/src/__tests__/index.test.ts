@@ -221,6 +221,70 @@ describe("tracker-jira plugin", () => {
       expect(issue.state).toBe("closed");
     });
 
+    it("maps custom status names to closed via statusCategory=done", async () => {
+      mockSprintResolution();
+      mockFetchJson({
+        ...sampleJiraIssue,
+        fields: {
+          ...sampleJiraIssue.fields,
+          status: {
+            name: "Shipped",
+            statusCategory: { key: "done", name: "Done" },
+          },
+        },
+      });
+      const issue = await tracker.getIssue("TT-142", project);
+      expect(issue.state).toBe("closed");
+    });
+
+    it("maps Dismissed status to cancelled even with statusCategory=done", async () => {
+      mockSprintResolution();
+      mockFetchJson({
+        ...sampleJiraIssue,
+        fields: {
+          ...sampleJiraIssue.fields,
+          status: {
+            name: "Dismissed",
+            statusCategory: { key: "done", name: "Done" },
+          },
+        },
+      });
+      const issue = await tracker.getIssue("TT-142", project);
+      expect(issue.state).toBe("cancelled");
+    });
+
+    it("maps Won't Do to cancelled", async () => {
+      mockSprintResolution();
+      mockFetchJson({
+        ...sampleJiraIssue,
+        fields: {
+          ...sampleJiraIssue.fields,
+          status: {
+            name: "Won't Do",
+            statusCategory: { key: "done", name: "Done" },
+          },
+        },
+      });
+      const issue = await tracker.getIssue("TT-142", project);
+      expect(issue.state).toBe("cancelled");
+    });
+
+    it("maps custom in-progress status via statusCategory=indeterminate", async () => {
+      mockSprintResolution();
+      mockFetchJson({
+        ...sampleJiraIssue,
+        fields: {
+          ...sampleJiraIssue.fields,
+          status: {
+            name: "Code Review",
+            statusCategory: { key: "indeterminate", name: "In Progress" },
+          },
+        },
+      });
+      const issue = await tracker.getIssue("TT-142", project);
+      expect(issue.state).toBe("in_progress");
+    });
+
     it("maps In Progress status to in_progress", async () => {
       mockSprintResolution();
       mockFetchJson({

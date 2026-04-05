@@ -114,9 +114,27 @@ function mapPriority(name?: string | null): number | undefined {
   return undefined;
 }
 
+/**
+ * Sanitize a string for use as a git branch name segment.
+ * Replaces runs of characters git rejects (spaces, ~^:?*[\..@{) with `-`,
+ * strips leading/trailing dots and dashes, and collapses repeats.
+ */
+function sanitizeForBranch(value: string): string {
+  return value
+    .replace(/[\s~^:?*[\]\\@{}'"`()]+/g, "-")
+    .replace(/\.+/g, ".")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
+}
+
 function extractSprintNumber(sprintName: string): string {
   const match = /sprint[\s\-_]*(\d+)/i.exec(sprintName);
-  return match ? match[1] : sprintName;
+  if (match) return match[1];
+  // Fallback: sanitize the raw sprint name so it's safe as a git branch
+  // segment. Sprint names like "Planning Phase" or "Alpha 2" would
+  // otherwise produce invalid branch names containing spaces.
+  const sanitized = sanitizeForBranch(sprintName);
+  return sanitized || "unknown";
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +155,9 @@ export function create(): Tracker {
     if (!email) throw new Error("Jira tracker: JIRA_EMAIL env var is required");
     if (!apiToken) throw new Error("Jira tracker: JIRA_API_TOKEN env var is required");
 
-    const cacheKey = `${baseUrl}|${email}`;
+    // Cache key includes apiToken so rotating the token invalidates the
+    // cached client (the baked-in Authorization header is otherwise stale).
+    const cacheKey = `${baseUrl}|${email}|${apiToken}`;
     let client = clients.get(cacheKey);
     if (!client) {
       client = new JiraClient({ baseUrl, email, apiToken });
@@ -325,6 +345,15 @@ export function create(): Tracker {
 // JQL builder
 // ---------------------------------------------------------------------------
 
+/**
+ * Escape a value for safe interpolation inside a JQL double-quoted string.
+ * JQL uses backslash escaping for `"` and `\` within quoted strings.
+ * See https://support.atlassian.com/jira-software-cloud/docs/jql-fields/
+ */
+function jqlQuote(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 function buildJql(
   customJql: string | undefined,
   projectKey: string,
@@ -334,7 +363,7 @@ function buildJql(
 
   const clauses: string[] = [];
   if (projectKey) {
-    clauses.push(`project = "${projectKey}"`);
+    clauses.push(`project = ${jqlQuote(projectKey)}`);
   }
   if (filters.state && filters.state !== "all") {
     if (filters.state === "open") {
@@ -345,11 +374,11 @@ function buildJql(
   }
   if (filters.labels && filters.labels.length > 0) {
     for (const label of filters.labels) {
-      clauses.push(`labels = "${label}"`);
+      clauses.push(`labels = ${jqlQuote(label)}`);
     }
   }
   if (filters.assignee) {
-    clauses.push(`assignee = "${filters.assignee}"`);
+    clauses.push(`assignee = ${jqlQuote(filters.assignee)}`);
   }
 
   return clauses.length > 0

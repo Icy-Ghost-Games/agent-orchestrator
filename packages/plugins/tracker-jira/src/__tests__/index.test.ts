@@ -169,6 +169,26 @@ describe("tracker-jira plugin", () => {
       expect(issue).not.toBeNull();
     });
 
+    it("invalidates cached client when apiToken rotates", async () => {
+      const t = create();
+      // First call with token A (sprint resolution mocks come first)
+      process.env.JIRA_API_TOKEN = "token-A";
+      mockSprintResolution();
+      mockFetchJson(sampleJiraIssue);
+      await t.getIssue("TT-1", project);
+      const firstAuth = fetchMock.mock.calls[0][1].headers.Authorization;
+      expect(firstAuth).toContain(Buffer.from("bot@acme.com:token-A").toString("base64"));
+
+      // Rotate token — next call must use the new token, not the cached one
+      fetchMock.mockReset();
+      process.env.JIRA_API_TOKEN = "token-B";
+      mockFetchJson(sampleJiraIssue);
+      await t.getIssue("TT-1", project);
+      const secondAuth = fetchMock.mock.calls[0][1].headers.Authorization;
+      expect(secondAuth).toContain(Buffer.from("bot@acme.com:token-B").toString("base64"));
+      expect(secondAuth).not.toBe(firstAuth);
+    });
+
     it("throws on first API call when baseUrl is missing", async () => {
       delete process.env.JIRA_BASE_URL;
       const projectNoUrl: ProjectConfig = {
@@ -442,6 +462,24 @@ describe("tracker-jira plugin", () => {
       expect(tracker.branchName("TT-42", customProject)).toBe("Agent/Sprint12/TT-42");
     });
 
+    it("sanitizes non-numeric sprint names for git branch safety", async () => {
+      mockSprintResolution("Planning Phase");
+      mockFetchJson(sampleJiraIssue);
+      await tracker.getIssue("TT-42", project);
+      // "Planning Phase" has a space — must not leak into branch name
+      expect(tracker.branchName("TT-42", project)).toBe("feat/SprintPlanning-Phase/TT-42");
+    });
+
+    it("strips unsafe characters from sprint names (quotes, braces, colons)", async () => {
+      mockSprintResolution('Q1 "Alpha": {release}');
+      mockFetchJson(sampleJiraIssue);
+      await tracker.getIssue("TT-42", project);
+      const branch = tracker.branchName("TT-42", project);
+      // No spaces, quotes, colons, or braces — all git-hostile chars
+      expect(branch).not.toMatch(/[\s"':{}]/);
+      expect(branch).toMatch(/^feat\/Sprint[\w.-]+\/TT-42$/);
+    });
+
     it("falls back to prefix-only when no active sprint", async () => {
       mockSprintResolution(null);
       mockFetchJson(sampleJiraIssue);
@@ -534,6 +572,32 @@ describe("tracker-jira plugin", () => {
       expect(url).toContain("project");
       expect(url).toContain("%22TT%22");
       expect(url).toContain("%22bug%22");
+    });
+
+    it("escapes double quotes in label filters (JQL injection prevention)", async () => {
+      mockFetchJson({ startAt: 0, maxResults: 50, total: 0, issues: [] });
+      await tracker.listIssues!({ labels: ['evil" OR project = "OTHER'] }, project);
+      const url = fetchMock.mock.calls[0][0] as string;
+      // The embedded quote must be backslash-escaped, not injected raw.
+      // Decoded JQL should contain labels = "evil\" OR project = \"OTHER"
+      const decoded = decodeURIComponent(url.replace(/\+/g, " "));
+      expect(decoded).toContain('labels = "evil\\" OR project = \\"OTHER"');
+    });
+
+    it("escapes double quotes in assignee filter", async () => {
+      mockFetchJson({ startAt: 0, maxResults: 50, total: 0, issues: [] });
+      await tracker.listIssues!({ assignee: 'alice" OR 1=1 OR "' }, project);
+      const url = fetchMock.mock.calls[0][0] as string;
+      const decoded = decodeURIComponent(url.replace(/\+/g, " "));
+      expect(decoded).toContain('assignee = "alice\\" OR 1=1 OR \\""');
+    });
+
+    it("escapes backslashes in values", async () => {
+      mockFetchJson({ startAt: 0, maxResults: 50, total: 0, issues: [] });
+      await tracker.listIssues!({ labels: ["back\\slash"] }, project);
+      const url = fetchMock.mock.calls[0][0] as string;
+      const decoded = decodeURIComponent(url.replace(/\+/g, " "));
+      expect(decoded).toContain('labels = "back\\\\slash"');
     });
 
     it("respects limit", async () => {

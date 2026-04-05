@@ -280,17 +280,22 @@ export function create(): Tracker {
           await client.transitionIssue(identifier, transitionName);
         }
       }
-      if (update.labels && update.labels.length > 0) {
+      // Labels are a single list on the Jira side, so add+remove must be
+      // resolved in one read-modify-write cycle. Two independent cycles
+      // would race (second fetch may predate first PUT, losing the add).
+      const hasAdds = update.labels && update.labels.length > 0;
+      const hasRemoves = update.removeLabels && update.removeLabels.length > 0;
+      if (hasAdds || hasRemoves) {
         const issue = await client.getIssue(identifier);
         const existing = issue.fields.labels ?? [];
-        const merged = [...new Set([...existing, ...update.labels])];
+        const removeSet = new Set(update.removeLabels ?? []);
+        const merged = [
+          ...new Set([
+            ...existing.filter((l) => !removeSet.has(l)),
+            ...(update.labels ?? []),
+          ]),
+        ];
         await client.updateIssue(identifier, { labels: merged });
-      }
-      if (update.removeLabels && update.removeLabels.length > 0) {
-        const issue = await client.getIssue(identifier);
-        const existing = issue.fields.labels ?? [];
-        const filtered = existing.filter((l) => !update.removeLabels!.includes(l));
-        await client.updateIssue(identifier, { labels: filtered });
       }
       if (update.assignee) {
         await client.updateIssue(identifier, {

@@ -57,8 +57,9 @@ function loadEnvFile(envPath: string): void {
       value = value.slice(1, -1);
     }
 
-    // Don't overwrite existing env vars
-    if (process.env[key] === undefined || process.env[key] === "") {
+    // Don't overwrite existing env vars — an explicitly-set empty string
+    // is a deliberate "disable" signal and must be preserved.
+    if (process.env[key] === undefined) {
       process.env[key] = value;
     }
   }

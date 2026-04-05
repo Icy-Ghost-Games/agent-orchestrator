@@ -650,6 +650,22 @@ describe("tracker-jira plugin", () => {
       expect(body.fields.labels).toEqual(["sso"]);
     });
 
+    it("merges add+remove labels in a single read-modify-write", async () => {
+      mockFetchJson(sampleJiraIssue); // labels: ["bug", "sso"]
+      mockFetch204();
+      await tracker.updateIssue!(
+        "TT-142",
+        { labels: ["new-label"], removeLabels: ["bug"] },
+        project,
+      );
+      // Exactly ONE getIssue + ONE PUT (no double-fetch race)
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const body = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+      expect(body.fields.labels).toContain("sso");
+      expect(body.fields.labels).toContain("new-label");
+      expect(body.fields.labels).not.toContain("bug");
+    });
+
     it("throws when transition not found", async () => {
       mockFetchJson({ transitions: [{ id: "21", name: "In Progress" }] });
       await expect(

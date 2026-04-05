@@ -161,8 +161,10 @@ describe("tracker-jira plugin", () => {
       // Later, .env is loaded and env vars appear
       process.env.JIRA_EMAIL = "late@acme.com";
       process.env.JIRA_API_TOKEN = "late-token";
-      mockFetchJson(sampleJiraIssue);
+      // Sprint resolution runs first on each call (not cached because the
+      // prior attempt failed due to missing creds — see resolveActiveSprint).
       mockSprintResolution();
+      mockFetchJson(sampleJiraIssue);
 
       // Same tracker instance now works without re-creating
       const issue = await t.getIssue("TT-1", project);
@@ -507,6 +509,24 @@ describe("tracker-jira plugin", () => {
       mockFetchJson(sampleJiraIssue);
       await tracker.getIssue("TT-42", project);
       expect(tracker.branchName("TT-42", project)).toBe("feat/TT-42");
+    });
+
+    it("retries sprint resolution after a transient failure (no cache poisoning)", async () => {
+      // First call: sprint resolution throws because creds aren't loaded yet
+      // (real-world scenario: tracker created before .env file is read).
+      delete process.env.JIRA_API_TOKEN;
+      const t = create();
+      await expect(t.getIssue("TT-42", project)).rejects.toThrow("JIRA_API_TOKEN");
+      // Sprint not resolved → branch has no Sprint segment
+      expect(t.branchName("TT-42", project)).toBe("feat/TT-42");
+
+      // Creds become available — sprint resolution must retry on next call,
+      // NOT return a cached null from the previous failure.
+      process.env.JIRA_API_TOKEN = "tok-recovered";
+      mockSprintResolution("Sprint 9");
+      mockFetchJson(sampleJiraIssue);
+      await t.getIssue("TT-42", project);
+      expect(t.branchName("TT-42", project)).toBe("feat/Sprint9/TT-42");
     });
 
     it("reads branchPrefix from project.tracker", () => {

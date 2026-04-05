@@ -191,14 +191,23 @@ export function create(): Tracker {
       const boardId = await client.findBoardId(projectKey);
       if (boardId) {
         const sprint = await client.getActiveSprint(boardId);
+        // Definitive result (sprint name or null for "no active sprint")
+        // — safe to cache.
         sprintCache.set(projectKey, sprint);
         return sprint;
       }
+      // Board lookup succeeded but found no board — stable state, cache it.
+      sprintCache.set(projectKey, null);
+      return null;
     } catch {
-      // Non-fatal — fall back to no sprint
+      // Transient failure (missing creds, network, API downtime). Do NOT
+      // cache — otherwise a single failed call permanently disables sprint
+      // resolution (and branchName drops the Sprint prefix) for the life
+      // of this tracker instance. Returning null lets this call degrade
+      // gracefully while leaving the cache open for a retry on the next
+      // call.
+      return null;
     }
-    sprintCache.set(projectKey, null);
-    return null;
   }
 
   const tracker: Tracker = {

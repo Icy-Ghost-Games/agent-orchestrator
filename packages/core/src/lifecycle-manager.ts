@@ -16,6 +16,7 @@ import {
   PR_STATE,
   CI_STATUS,
   TERMINAL_STATUSES,
+  isOrchestratorSession,
   type LifecycleManager,
   type SessionManager,
   type SessionId,
@@ -35,7 +36,6 @@ import {
   type ProjectConfig as _ProjectConfig,
   type PREnrichmentData,
   type CICheck,
-  isOrchestratorSession,
 } from "./types.js";
 import { updateMetadata } from "./metadata.js";
 import { getSessionsDir } from "./paths.js";
@@ -218,13 +218,6 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
   /** Throttle interval for review backlog API calls (2 minutes). */
   const REVIEW_BACKLOG_THROTTLE_MS = 2 * 60 * 1000;
-
-  /**
-   * Per-session timestamp of when a terminal status was first observed.
-   * After a grace period, the session is automatically archived (kill + destroy).
-   * Orchestrator sessions are excluded from auto-cleanup.
-   */
-  const terminalSince = new Map<SessionId, number>();
 
   /** Grace period before auto-cleaning terminal sessions (2 minutes). */
   const AUTO_CLEANUP_GRACE_MS = 2 * 60 * 1000;
@@ -1332,27 +1325,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           lastReviewBacklogCheckAt.delete(sessionId);
         }
       }
-      for (const sessionId of terminalSince.keys()) {
-        if (!currentSessionIds.has(sessionId)) {
-          terminalSince.delete(sessionId);
-        }
-      }
-
       // Auto-cleanup: archive terminal sessions after a grace period.
-      // This destroys runtimes and worktrees so they don't accumulate.
+      // Uses session.lastActivityAt (persisted to disk) so the grace period
+      // survives lifecycle worker restarts — no in-memory tracking needed.
       // Orchestrator sessions are excluded — they are long-lived.
       const now = Date.now();
       for (const session of sessions) {
-        if (!TERMINAL_STATUSES.has(session.status)) {
-          terminalSince.delete(session.id);
-          continue;
-        }
-
-        // Record when terminal status was first observed
-        if (!terminalSince.has(session.id)) {
-          terminalSince.set(session.id, now);
-          continue;
-        }
+        if (!TERMINAL_STATUSES.has(session.status)) continue;
 
         // Skip orchestrator sessions
         const project = config.projects[session.projectId];
@@ -1360,12 +1339,13 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           continue;
         }
 
-        // After grace period, archive and destroy
-        const since = terminalSince.get(session.id)!;
-        if (now - since >= AUTO_CLEANUP_GRACE_MS) {
+        // Use lastActivityAt as the terminal timestamp — once a session
+        // reaches terminal status it stops getting activity updates, so
+        // this effectively marks when it became terminal.
+        const terminalAt = session.lastActivityAt.getTime();
+        if (now - terminalAt >= AUTO_CLEANUP_GRACE_MS) {
           try {
             await sessionManager.kill(session.id);
-            terminalSince.delete(session.id);
             states.delete(session.id);
             observer.recordOperation({
               metric: "lifecycle_poll",

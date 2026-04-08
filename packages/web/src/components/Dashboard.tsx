@@ -365,27 +365,6 @@ function DashboardInner({
     setSheetState({ sessionId: session.id, mode: "confirm-kill" });
   }, [isMobile, killSession]);
 
-  const [cleaningUp, setCleaningUp] = useState(false);
-
-  const handleCleanup = useCallback(async () => {
-    setCleaningUp(true);
-    try {
-      const res = await fetch("/api/sessions/cleanup", { method: "POST" });
-      if (!res.ok) {
-        const text = await res.text();
-        showToast(`Cleanup failed: ${text}`, "error");
-      } else {
-        const data = await res.json();
-        const count = data.killed?.length ?? 0;
-        showToast(count > 0 ? `Cleaned up ${count} session${count === 1 ? "" : "s"}` : "Nothing to clean up", "success");
-      }
-    } catch {
-      showToast("Network error during cleanup", "error");
-    } finally {
-      setCleaningUp(false);
-    }
-  }, [showToast]);
-
   const handlePreview = useCallback((session: DashboardSession) => {
     setSheetState({ sessionId: session.id, mode: "preview" });
   }, []);
@@ -707,37 +686,26 @@ function DashboardInner({
 
         {!allProjectsView && grouped.done.length > 0 && (
           <div className="done-bar mt-6">
-            <div className="done-bar__header">
-              <button
-                type="button"
-                className="done-bar__toggle"
-                onClick={() => setDoneExpanded((v) => !v)}
-                aria-expanded={doneExpanded}
+            <button
+              type="button"
+              className="done-bar__toggle"
+              onClick={() => setDoneExpanded((v) => !v)}
+              aria-expanded={doneExpanded}
+            >
+              <svg
+                className={`done-bar__chevron${doneExpanded ? " done-bar__chevron--open" : ""}`}
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
               >
-                <svg
-                  className={`done-bar__chevron${doneExpanded ? " done-bar__chevron--open" : ""}`}
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                >
-                  <path d="m9 18 6-6-6-6" />
-                </svg>
-                <span>Done / Terminated</span>
-                <span className="done-bar__count">{grouped.done.length}</span>
-                <span className="done-bar__rule" aria-hidden="true" />
-              </button>
-              <button
-                type="button"
-                className="done-bar__cleanup"
-                onClick={() => { void handleCleanup(); }}
-                disabled={cleaningUp}
-                title="Archive all done sessions and destroy their worktrees"
-              >
-                {cleaningUp ? "Cleaning..." : "Clean up"}
-              </button>
-            </div>
+                <path d="m9 18 6-6-6-6" />
+              </svg>
+              <span>Done / Terminated</span>
+              <span className="done-bar__count">{grouped.done.length}</span>
+              <span className="done-bar__rule" aria-hidden="true" />
+            </button>
             {doneExpanded && (
               <div className="done-bar__cards">
                 {grouped.done.map((session) => (
@@ -748,6 +716,7 @@ function DashboardInner({
                     onKill={handleKill}
                     onMerge={handleMerge}
                     onRestore={handleRestore}
+                    onCleanup={killSession}
                   />
                 ))}
               </div>

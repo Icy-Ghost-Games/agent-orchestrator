@@ -35,6 +35,7 @@ import {
   type ProjectConfig as _ProjectConfig,
   type PREnrichmentData,
   type CICheck,
+  isOrchestratorSession,
 } from "./types.js";
 import { updateMetadata } from "./metadata.js";
 import { getSessionsDir } from "./paths.js";
@@ -217,6 +218,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
   /** Throttle interval for review backlog API calls (2 minutes). */
   const REVIEW_BACKLOG_THROTTLE_MS = 2 * 60 * 1000;
+
+  /**
+   * Per-session timestamp of when a terminal status was first observed.
+   * After a grace period, the session is automatically archived (kill + destroy).
+   * Orchestrator sessions are excluded from auto-cleanup.
+   */
+  const terminalSince = new Map<SessionId, number>();
+
+  /** Grace period before auto-cleaning terminal sessions (2 minutes). */
+  const AUTO_CLEANUP_GRACE_MS = 2 * 60 * 1000;
 
   /**
    * Populate the PR enrichment cache using batch GraphQL queries.
@@ -1319,6 +1330,56 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       for (const sessionId of lastReviewBacklogCheckAt.keys()) {
         if (!currentSessionIds.has(sessionId)) {
           lastReviewBacklogCheckAt.delete(sessionId);
+        }
+      }
+      for (const sessionId of terminalSince.keys()) {
+        if (!currentSessionIds.has(sessionId)) {
+          terminalSince.delete(sessionId);
+        }
+      }
+
+      // Auto-cleanup: archive terminal sessions after a grace period.
+      // This destroys runtimes and worktrees so they don't accumulate.
+      // Orchestrator sessions are excluded — they are long-lived.
+      const now = Date.now();
+      for (const session of sessions) {
+        if (!TERMINAL_STATUSES.has(session.status)) {
+          terminalSince.delete(session.id);
+          continue;
+        }
+
+        // Record when terminal status was first observed
+        if (!terminalSince.has(session.id)) {
+          terminalSince.set(session.id, now);
+          continue;
+        }
+
+        // Skip orchestrator sessions
+        const project = config.projects[session.projectId];
+        if (project && isOrchestratorSession(session, project.sessionPrefix)) {
+          continue;
+        }
+
+        // After grace period, archive and destroy
+        const since = terminalSince.get(session.id)!;
+        if (now - since >= AUTO_CLEANUP_GRACE_MS) {
+          try {
+            await sessionManager.kill(session.id);
+            terminalSince.delete(session.id);
+            states.delete(session.id);
+            observer.recordOperation({
+              metric: "lifecycle_poll",
+              operation: "lifecycle.auto_cleanup",
+              outcome: "success",
+              correlationId,
+              projectId: session.projectId,
+              sessionId: session.id,
+              data: { status: session.status },
+              level: "info",
+            });
+          } catch {
+            // Non-fatal — will retry next cycle
+          }
         }
       }
 

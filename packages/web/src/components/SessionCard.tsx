@@ -22,6 +22,7 @@ interface SessionCardProps {
   onKill?: (sessionId: string) => void;
   onMerge?: (prNumber: number) => void;
   onRestore?: (sessionId: string) => void;
+  onCleanup?: (sessionId: string) => void;
 }
 
 /**
@@ -92,7 +93,7 @@ function getDoneStatusInfo(session: DashboardSession): {
   };
 }
 
-function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: SessionCardProps) {
+function SessionCardView({ session, onSend, onKill, onMerge, onRestore, onCleanup }: SessionCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [sendingAction, setSendingAction] = useState<string | null>(null);
   const [failedAction, setFailedAction] = useState<string | null>(null);
@@ -225,6 +226,28 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore }: Sessio
                 <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
               </svg>
               restore
+            </button>
+          )}
+          {onCleanup && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onCleanup(session.id);
+              }}
+              className="done-cleanup-btn"
+              title="Archive session and destroy worktree"
+            >
+              <svg
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                viewBox="0 0 24 24"
+                className="h-3 w-3"
+              >
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              </svg>
+              clean up
             </button>
           )}
         </div>
@@ -719,7 +742,8 @@ function areSessionCardPropsEqual(prev: SessionCardProps, next: SessionCardProps
     prev.onSend === next.onSend &&
     prev.onKill === next.onKill &&
     prev.onMerge === next.onMerge &&
-    prev.onRestore === next.onRestore
+    prev.onRestore === next.onRestore &&
+    prev.onCleanup === next.onCleanup
   );
 }
 

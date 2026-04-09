@@ -16,6 +16,7 @@ import {
   PR_STATE,
   CI_STATUS,
   TERMINAL_STATUSES,
+  isOrchestratorSession,
   type LifecycleManager,
   type SessionManager,
   type SessionId,
@@ -218,6 +219,9 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
 
   /** Throttle interval for review backlog API calls (2 minutes). */
   const REVIEW_BACKLOG_THROTTLE_MS = 2 * 60 * 1000;
+
+  /** Grace period before auto-cleaning terminal sessions (2 minutes). */
+  const AUTO_CLEANUP_GRACE_MS = 2 * 60 * 1000;
 
   /**
    * Populate the PR enrichment cache using batch GraphQL queries.
@@ -1342,6 +1346,43 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       for (const sessionId of lastReviewBacklogCheckAt.keys()) {
         if (!currentSessionIds.has(sessionId)) {
           lastReviewBacklogCheckAt.delete(sessionId);
+        }
+      }
+      // Auto-cleanup: archive terminal sessions after a grace period.
+      // Uses session.lastActivityAt (persisted to disk) so the grace period
+      // survives lifecycle worker restarts — no in-memory tracking needed.
+      // Orchestrator sessions are excluded — they are long-lived.
+      const now = Date.now();
+      for (const session of sessions) {
+        if (!TERMINAL_STATUSES.has(session.status)) continue;
+
+        // Skip orchestrator sessions
+        const project = config.projects[session.projectId];
+        if (project && isOrchestratorSession(session, project.sessionPrefix)) {
+          continue;
+        }
+
+        // Use lastActivityAt as the terminal timestamp — once a session
+        // reaches terminal status it stops getting activity updates, so
+        // this effectively marks when it became terminal.
+        const terminalAt = session.lastActivityAt.getTime();
+        if (now - terminalAt >= AUTO_CLEANUP_GRACE_MS) {
+          try {
+            await sessionManager.kill(session.id);
+            states.delete(session.id);
+            observer.recordOperation({
+              metric: "lifecycle_poll",
+              operation: "lifecycle.auto_cleanup",
+              outcome: "success",
+              correlationId,
+              projectId: session.projectId,
+              sessionId: session.id,
+              data: { status: session.status },
+              level: "info",
+            });
+          } catch {
+            // Non-fatal — will retry next cycle
+          }
         }
       }
 

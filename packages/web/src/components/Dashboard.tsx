@@ -716,6 +716,7 @@ function DashboardInner({
                     onKill={handleKill}
                     onMerge={handleMerge}
                     onRestore={handleRestore}
+                    onCleanup={killSession}
                   />
                 ))}
               </div>

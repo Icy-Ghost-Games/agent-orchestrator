@@ -1715,6 +1715,117 @@ describe("sleep/wake burst guard", () => {
   });
 });
 
+describe("auto-cleanup terminal sessions", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("archives terminal sessions after the grace period", async () => {
+    // lastActivityAt 3 minutes ago — already past the 2-minute grace
+    const sessions = [
+      makeSession({
+        id: "s-1",
+        status: "merged" as SessionStatus,
+        lastActivityAt: new Date(Date.now() - 3 * 60 * 1000),
+      }),
+    ];
+    vi.mocked(mockSessionManager.list).mockResolvedValue(sessions);
+
+    const lm = createLifecycleManager({
+      config,
+      registry: mockRegistry,
+      sessionManager: mockSessionManager,
+    });
+
+    lm.start(30_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockSessionManager.kill).toHaveBeenCalledWith("s-1");
+
+    lm.stop();
+  });
+
+  it("does not archive terminal sessions within the grace period", async () => {
+    // lastActivityAt just now — within the 2-minute grace
+    const sessions = [
+      makeSession({
+        id: "s-1",
+        status: "merged" as SessionStatus,
+        lastActivityAt: new Date(),
+      }),
+    ];
+    vi.mocked(mockSessionManager.list).mockResolvedValue(sessions);
+
+    const lm = createLifecycleManager({
+      config,
+      registry: mockRegistry,
+      sessionManager: mockSessionManager,
+    });
+
+    lm.start(30_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockSessionManager.kill).not.toHaveBeenCalled();
+
+    lm.stop();
+  });
+
+  it("does not auto-cleanup orchestrator sessions", async () => {
+    const sessions = [
+      makeSession({
+        id: "app-orchestrator-1",
+        status: "killed" as SessionStatus,
+        metadata: { role: "orchestrator" },
+        lastActivityAt: new Date(Date.now() - 10 * 60 * 1000),
+      }),
+    ];
+    vi.mocked(mockSessionManager.list).mockResolvedValue(sessions);
+
+    const lm = createLifecycleManager({
+      config,
+      registry: mockRegistry,
+      sessionManager: mockSessionManager,
+    });
+
+    lm.start(30_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockSessionManager.kill).not.toHaveBeenCalled();
+
+    lm.stop();
+  });
+
+  it("does not cleanup sessions that return to active status", async () => {
+    // Start as terminal with old lastActivityAt
+    const session = makeSession({
+      id: "s-1",
+      status: "killed" as SessionStatus,
+      lastActivityAt: new Date(Date.now() - 10 * 60 * 1000),
+    });
+    vi.mocked(mockSessionManager.list).mockResolvedValue([session]);
+
+    const lm = createLifecycleManager({
+      config,
+      registry: mockRegistry,
+      sessionManager: mockSessionManager,
+    });
+
+    // Session comes back to working before first poll (e.g. restored)
+    session.status = "working" as SessionStatus;
+
+    lm.start(30_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockSessionManager.kill).not.toHaveBeenCalled();
+
+    lm.stop();
+  });
+});
+
 describe("summary pinning", () => {
   it("pins first quality summary when pinnedSummary not set", async () => {
     const session = makeSession({

@@ -10,6 +10,11 @@ vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(),
 }));
 
+// DispatchQueue fetches /api/dispatch/queue on mount — not relevant to this test.
+vi.mock("@/components/DispatchQueue", () => ({
+  DispatchQueue: () => null,
+}));
+
 vi.mock("@/components/SessionCard", () => ({
   SessionCard: memo(({ session }: { session: { id: string } }) => {
     renderCounts.set(session.id, (renderCounts.get(session.id) ?? 0) + 1);

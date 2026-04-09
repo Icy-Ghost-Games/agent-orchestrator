@@ -1869,6 +1869,151 @@ html.light .xterm .xterm-viewport:hover::-webkit-scrollbar-thumb:active {
   padding-bottom: 8px;
 }
 
+/* ── Dispatch Queue ─────────────────────────────────────── */
+
+.dispatch-queue {
+  margin-bottom: 16px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 8px;
+  background: var(--color-bg-card);
+  overflow: hidden;
+}
+
+.dispatch-queue__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--color-border-default);
+}
+
+.dispatch-queue__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--color-accent-orange);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.dispatch-queue__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.dispatch-queue__subtitle {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.dispatch-queue__list {
+  display: flex;
+  flex-direction: column;
+}
+
+.dispatch-queue__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.dispatch-queue__item:last-child {
+  border-bottom: none;
+}
+
+.dispatch-queue__item-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.dispatch-queue__issue-id {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-accent-blue);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.dispatch-queue__issue-id:hover {
+  text-decoration: underline;
+}
+
+.dispatch-queue__issue-title {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dispatch-queue__priority {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--color-bg-subtle);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.dispatch-queue__project {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.dispatch-queue__actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.dispatch-queue__btn {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--color-border-default);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.dispatch-queue__btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dispatch-queue__btn--approve {
+  background: var(--color-status-ready);
+  color: #fff;
+  border-color: transparent;
+}
+
+.dispatch-queue__btn--approve:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.dispatch-queue__btn--reject {
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.dispatch-queue__btn--reject:hover:not(:disabled) {
+  background: var(--color-bg-subtle);
+}
+
 .kanban-board-wrap {
   position: relative;
   margin-top: 12px;

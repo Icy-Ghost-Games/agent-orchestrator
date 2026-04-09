@@ -215,6 +215,7 @@ const SEND_CONFIRMATION_POLL_MS = 500;
 const SEND_CONFIRMATION_OUTPUT_LINES = 20;
 const SEND_BOOTSTRAP_READY_TIMEOUT_MS = 20_000;
 const SEND_BOOTSTRAP_STABLE_POLLS = 2;
+const SEND_ENTER_RETRIES = 2;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -2066,6 +2067,8 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
       await runtimePlugin.sendMessage(handle, message);
 
+      let enterRetries = 0;
+
       for (let attempt = 1; attempt <= SEND_CONFIRMATION_ATTEMPTS; attempt++) {
         // Sleep before each check (including the first) so the runtime has time
         // to reflect the message in its output.
@@ -2074,16 +2077,36 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         const output = await captureOutput(handle);
         const activity = detectActivityFromOutput(output) ?? session.activity;
         const updatedAt = await getOpenCodeSessionUpdatedAt();
-        const delivered =
+
+        // Strong delivery signals — the agent definitely received the message.
+        const agentReacted =
           (baselineUpdatedAt !== undefined &&
             updatedAt !== undefined &&
             updatedAt > baselineUpdatedAt) ||
           hasQueuedMessage(output) ||
-          (output.length > 0 && output !== baselineOutput) ||
           (baselineActivity !== "active" && activity === "active") ||
           (baselineActivity !== "waiting_input" && activity === "waiting_input");
 
-        if (delivered) {
+        if (agentReacted) {
+          return;
+        }
+
+        // Weak signal: output changed (text appeared in terminal) but the agent
+        // is still idle — the message was typed at the prompt but Enter likely
+        // didn't register (common with TUI agents like Copilot where the Ink
+        // input handler may swallow a keystroke during a render cycle). Re-send
+        // the full message (C-u clears the stuck text, re-types, re-presses Enter).
+        const outputChanged = output.length > 0 && output !== baselineOutput;
+        const agentStillIdle = activity === "idle" || activity === "ready";
+
+        if (outputChanged && agentStillIdle && enterRetries < SEND_ENTER_RETRIES) {
+          enterRetries++;
+          await runtimePlugin.sendMessage(handle, message);
+          continue;
+        }
+
+        // Output changed and agent is no longer idle — delivered.
+        if (outputChanged && !agentStillIdle) {
           return;
         }
       }

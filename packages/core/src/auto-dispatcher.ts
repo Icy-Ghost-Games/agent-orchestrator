@@ -1,12 +1,11 @@
 /**
  * AutoDispatcher — Automatic work discovery & session spawning.
  *
- * Polls the tracker for eligible issues and auto-spawns sessions
- * when capacity is available. Opt-in per project via `autoDispatch` config.
+ * Polls the tracker for eligible issues (labeled "ai-agent" by default)
+ * and auto-spawns sessions when capacity is available. After spawning,
+ * transitions the issue to "in_progress" so other dispatchers skip it.
  *
- * Fits alongside the existing LifecycleManager polling loop — uses the
- * same SessionManager.spawn() path as `ao spawn` and the same Tracker
- * plugin interface.
+ * Opt-in per project via `autoDispatch` config.
  */
 
 import {
@@ -44,9 +43,12 @@ function priorityRank(name: string): number {
   return PRIORITY_RANK[name.toLowerCase()] ?? 3;
 }
 
+/** Default label that issues must have to be eligible for auto-dispatch. */
+const DEFAULT_LABELS = ["ai-agent"];
+
 /** Event data emitted by the dispatcher (passed to observer). */
 export interface AutoDispatchEvent {
-  action: "spawned" | "queued" | "notified" | "skipped" | "error";
+  action: "spawned" | "notified" | "skipped" | "error";
   issueId: string;
   issueTitle?: string;
   reason?: string;
@@ -74,12 +76,6 @@ export interface AutoDispatcher {
   getClaimedIssues(): ReadonlySet<string>;
   /** Get today's spawn count. */
   getDailySpawnCount(): number;
-  /** Get queued issues awaiting approval. */
-  getQueue(): Issue[];
-  /** Approve a queued issue for spawning. */
-  approve(issueId: string): Promise<boolean>;
-  /** Reject a queued issue (remove from queue). */
-  reject(issueId: string): boolean;
 }
 
 export function createAutoDispatcher(deps: AutoDispatcherDeps): AutoDispatcher {
@@ -89,7 +85,9 @@ export function createAutoDispatcher(deps: AutoDispatcherDeps): AutoDispatcher {
   const claimedIssues = new Set<string>();
   let dailySpawnCount = 0;
   let dailyResetDate = "";
-  const queue: Map<string, Issue> = new Map();
+
+  /** Resolve required labels: config override or default ["ai-agent"]. */
+  const requiredLabels = config.filters?.labels ?? DEFAULT_LABELS;
 
   function resetDailyCountIfNewDay(): void {
     const today = new Date().toISOString().slice(0, 10);
@@ -138,6 +136,16 @@ export function createAutoDispatcher(deps: AutoDispatcherDeps): AutoDispatcher {
     }
   }
 
+  /** Transition the issue to "in_progress" so other dispatchers skip it. */
+  async function markInProgress(issueId: string): Promise<void> {
+    if (!tracker.updateIssue) return;
+    try {
+      await tracker.updateIssue(issueId, { state: "in_progress" }, project);
+    } catch {
+      // Best-effort — the in-memory claimedIssues set still prevents same-instance duplication
+    }
+  }
+
   async function dispatch(issue: Issue): Promise<void> {
     const correlationId = createCorrelationId("autodispatch");
 
@@ -155,25 +163,14 @@ export function createAutoDispatcher(deps: AutoDispatcherDeps): AutoDispatcher {
       return;
     }
 
-    if (config.onNewIssue === "queue" || config.requireApproval) {
-      queue.set(issue.id, issue);
-      observer.recordOperation({
-        metric: "lifecycle_poll",
-        operation: "autodispatch.queued",
-        outcome: "success",
-        correlationId,
-        projectId,
-        data: { issueId: issue.id, issueTitle: issue.title },
-        level: "info",
-      });
-      return;
-    }
-
     // Spawn
     try {
       const session = await sessionManager.spawn({ projectId, issueId: issue.id });
       claimedIssues.add(issue.id);
       dailySpawnCount++;
+
+      // Mark issue as in-progress in the tracker (cross-process coordination)
+      await markInProgress(issue.id);
 
       // Mark session as auto-dispatched for dashboard badge
       try {
@@ -238,8 +235,11 @@ export function createAutoDispatcher(deps: AutoDispatcherDeps): AutoDispatcher {
       // Guard: tracker must support listIssues
       if (!tracker.listIssues) return;
 
-      // Fetch eligible issues from tracker
-      const filters: IssueFilters = { state: "open" };
+      // Fetch eligible issues — only those with the required labels
+      const filters: IssueFilters = {
+        state: "open",
+        labels: requiredLabels.length > 0 ? requiredLabels : undefined,
+      };
       let issues: Issue[];
       try {
         issues = await tracker.listIssues(filters, project);
@@ -260,7 +260,7 @@ export function createAutoDispatcher(deps: AutoDispatcherDeps): AutoDispatcher {
       // Filter out already-claimed issues (active sessions)
       const unclaimed = issues.filter((i) => !claimedIssues.has(i.id));
 
-      // Apply additional filters
+      // Apply additional filters (excludeLabels, minPriority)
       const eligible = applyFilters(unclaimed, config.filters);
 
       // Sort by priority (lower number = higher priority)
@@ -320,29 +320,6 @@ export function createAutoDispatcher(deps: AutoDispatcherDeps): AutoDispatcher {
     getDailySpawnCount(): number {
       resetDailyCountIfNewDay();
       return dailySpawnCount;
-    },
-
-    getQueue(): Issue[] {
-      return Array.from(queue.values());
-    },
-
-    async approve(issueId: string): Promise<boolean> {
-      const issue = queue.get(issueId);
-      if (!issue) return false;
-      queue.delete(issueId);
-
-      try {
-        await sessionManager.spawn({ projectId, issueId: issue.id });
-        claimedIssues.add(issue.id);
-        dailySpawnCount++;
-        return true;
-      } catch {
-        return false;
-      }
-    },
-
-    reject(issueId: string): boolean {
-      return queue.delete(issueId);
     },
   };
 }

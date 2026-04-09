@@ -24,7 +24,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     description: "desc",
     url: "https://example.com/ISSUE-1",
     state: "open",
-    labels: [],
+    labels: ["ai-agent"],
     priority: 3,
     ...overrides,
   };
@@ -55,7 +55,6 @@ function makeConfig(overrides: Partial<AutoDispatchConfig> = {}): AutoDispatchCo
     pollInterval: 5,
     maxConcurrent: 3,
     maxDaily: 20,
-    requireApproval: false,
     onNewIssue: "spawn",
     ...overrides,
   };
@@ -85,6 +84,7 @@ function makeDeps(overrides: Partial<AutoDispatcherDeps> = {}): AutoDispatcherDe
       branchName: vi.fn(),
       generatePrompt: vi.fn(),
       listIssues: vi.fn().mockResolvedValue([]),
+      updateIssue: vi.fn().mockResolvedValue(undefined),
     } as unknown as Tracker,
     sessionManager: {
       spawn: vi.fn().mockResolvedValue(makeSession()),
@@ -137,6 +137,67 @@ describe("AutoDispatcher", () => {
     expect(deps.sessionManager.spawn).toHaveBeenCalledTimes(2);
     expect(deps.sessionManager.spawn).toHaveBeenCalledWith({ projectId: "my-app", issueId: "A" });
     expect(deps.sessionManager.spawn).toHaveBeenCalledWith({ projectId: "my-app", issueId: "B" });
+  });
+
+  it("passes labels filter to tracker.listIssues", async () => {
+    const deps = makeDeps({
+      config: makeConfig({
+        filters: { labels: ["ai-agent", "auto"], excludeLabels: [] },
+      }),
+    });
+    vi.mocked(deps.tracker.listIssues!).mockResolvedValue([]);
+    vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
+
+    const d = createAutoDispatcher(deps);
+    await d.tick();
+
+    expect(deps.tracker.listIssues).toHaveBeenCalledWith(
+      { state: "open", labels: ["ai-agent", "auto"] },
+      expect.anything(),
+    );
+  });
+
+  it("uses default 'ai-agent' label when no labels configured", async () => {
+    const deps = makeDeps({
+      config: makeConfig(), // no filters
+    });
+    vi.mocked(deps.tracker.listIssues!).mockResolvedValue([]);
+    vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
+
+    const d = createAutoDispatcher(deps);
+    await d.tick();
+
+    expect(deps.tracker.listIssues).toHaveBeenCalledWith(
+      { state: "open", labels: ["ai-agent"] },
+      expect.anything(),
+    );
+  });
+
+  it("transitions issue to in_progress after spawning", async () => {
+    const deps = makeDeps();
+    vi.mocked(deps.tracker.listIssues!).mockResolvedValue([makeIssue({ id: "A" })]);
+    vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
+
+    const d = createAutoDispatcher(deps);
+    await d.tick();
+
+    expect(deps.tracker.updateIssue).toHaveBeenCalledWith(
+      "A",
+      { state: "in_progress" },
+      expect.anything(),
+    );
+  });
+
+  it("still spawns when tracker has no updateIssue", async () => {
+    const deps = makeDeps();
+    (deps.tracker as unknown as Record<string, unknown>).updateIssue = undefined;
+    vi.mocked(deps.tracker.listIssues!).mockResolvedValue([makeIssue({ id: "A" })]);
+    vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
+
+    const d = createAutoDispatcher(deps);
+    await d.tick();
+
+    expect(deps.sessionManager.spawn).toHaveBeenCalledTimes(1);
   });
 
   it("skips when daily limit is reached", async () => {
@@ -216,14 +277,15 @@ describe("AutoDispatcher", () => {
     const deps = makeDeps({
       config: makeConfig({
         filters: {
+          labels: ["ai-agent"],
           excludeLabels: ["blocked", "wont-fix"],
         },
       }),
     });
     vi.mocked(deps.tracker.listIssues!).mockResolvedValue([
-      makeIssue({ id: "A", labels: ["blocked"] }),
-      makeIssue({ id: "B", labels: ["feature"] }),
-      makeIssue({ id: "C", labels: ["wont-fix", "feature"] }),
+      makeIssue({ id: "A", labels: ["ai-agent", "blocked"] }),
+      makeIssue({ id: "B", labels: ["ai-agent", "feature"] }),
+      makeIssue({ id: "C", labels: ["ai-agent", "wont-fix", "feature"] }),
     ]);
     vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
 
@@ -238,6 +300,7 @@ describe("AutoDispatcher", () => {
     const deps = makeDeps({
       config: makeConfig({
         filters: {
+          labels: ["ai-agent"],
           minPriority: "Medium",
           excludeLabels: [],
         },
@@ -275,70 +338,6 @@ describe("AutoDispatcher", () => {
     const calls = vi.mocked(deps.sessionManager.spawn).mock.calls;
     expect(calls[0][0]).toEqual({ projectId: "my-app", issueId: "HIGH" });
     expect(calls[1][0]).toEqual({ projectId: "my-app", issueId: "MED" });
-  });
-
-  it("queues issues when onNewIssue is 'queue'", async () => {
-    const deps = makeDeps({
-      config: makeConfig({ onNewIssue: "queue" }),
-    });
-    vi.mocked(deps.tracker.listIssues!).mockResolvedValue([makeIssue({ id: "A" })]);
-    vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
-
-    const d = createAutoDispatcher(deps);
-    await d.tick();
-
-    expect(deps.sessionManager.spawn).not.toHaveBeenCalled();
-    expect(d.getQueue()).toHaveLength(1);
-    expect(d.getQueue()[0].id).toBe("A");
-  });
-
-  it("queues issues when requireApproval is true", async () => {
-    const deps = makeDeps({
-      config: makeConfig({ requireApproval: true }),
-    });
-    vi.mocked(deps.tracker.listIssues!).mockResolvedValue([makeIssue({ id: "A" })]);
-    vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
-
-    const d = createAutoDispatcher(deps);
-    await d.tick();
-
-    expect(deps.sessionManager.spawn).not.toHaveBeenCalled();
-    expect(d.getQueue()).toHaveLength(1);
-  });
-
-  it("approve spawns from queue and claims the issue", async () => {
-    const deps = makeDeps({
-      config: makeConfig({ onNewIssue: "queue" }),
-    });
-    vi.mocked(deps.tracker.listIssues!).mockResolvedValue([makeIssue({ id: "A" })]);
-    vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
-
-    const d = createAutoDispatcher(deps);
-    await d.tick();
-
-    expect(d.getQueue()).toHaveLength(1);
-
-    const result = await d.approve("A");
-    expect(result).toBe(true);
-    expect(deps.sessionManager.spawn).toHaveBeenCalledWith({ projectId: "my-app", issueId: "A" });
-    expect(d.getQueue()).toHaveLength(0);
-    expect(d.getClaimedIssues().has("A")).toBe(true);
-  });
-
-  it("reject removes issue from queue", async () => {
-    const deps = makeDeps({
-      config: makeConfig({ onNewIssue: "queue" }),
-    });
-    vi.mocked(deps.tracker.listIssues!).mockResolvedValue([makeIssue({ id: "A" })]);
-    vi.mocked(deps.sessionManager.list).mockResolvedValue([]);
-
-    const d = createAutoDispatcher(deps);
-    await d.tick();
-
-    const result = d.reject("A");
-    expect(result).toBe(true);
-    expect(d.getQueue()).toHaveLength(0);
-    expect(deps.sessionManager.spawn).not.toHaveBeenCalled();
   });
 
   it("notifies when onNewIssue is 'notify'", async () => {

@@ -24,7 +24,6 @@ import { ToastProvider, useToast } from "./Toast";
 import { BottomSheet } from "./BottomSheet";
 import { ConnectionBar } from "./ConnectionBar";
 import { MobileBottomNav } from "./MobileBottomNav";
-import { DispatchQueue } from "./DispatchQueue";
 import { getProjectScopedHref } from "@/lib/project-utils";
 
 interface DashboardProps {
@@ -631,8 +630,6 @@ function DashboardInner({
             spawnErrors={spawnErrors}
           />
         )}
-
-        {!allProjectsView && <DispatchQueue />}
 
         {!allProjectsView && hasAnySessions && (
           <div className="kanban-board-wrap">

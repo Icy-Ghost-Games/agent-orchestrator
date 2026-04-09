@@ -1208,6 +1208,8 @@ export interface ProjectConfig {
 
 /** Filtering criteria for auto-dispatch issue selection */
 export interface AutoDispatchFilters {
+  /** Only issues with ALL of these labels are eligible (default: ["ai-agent"]) */
+  labels: string[];
   /** Minimum priority level name (issues below this are skipped) */
   minPriority?: string;
   /** Issues with any of these labels are excluded */
@@ -1226,12 +1228,10 @@ export interface AutoDispatchConfig {
   maxConcurrent: number;
   /** Max sessions spawned per calendar day — cost guard (default: 20) */
   maxDaily: number;
-  /** If true, issues go to a queue for human approval before spawning (default: false) */
-  requireApproval: boolean;
   /** Additional filters beyond the tracker query */
   filters?: AutoDispatchFilters;
   /** What to do when a new eligible issue is found (default: "spawn") */
-  onNewIssue: "spawn" | "queue" | "notify";
+  onNewIssue: "spawn" | "notify";
 }
 
 export interface TrackerConfig {
@@ -1491,6 +1491,7 @@ export interface LifecycleManager {
 
   /** Get auto-dispatchers by project ID (empty if none are enabled) */
   getDispatchers(): ReadonlyMap<string, import("./auto-dispatcher.js").AutoDispatcher>;
+
 
   /** Force-check a specific session now */
   check(sessionId: SessionId): Promise<void>;

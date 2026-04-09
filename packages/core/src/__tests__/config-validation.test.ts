@@ -1105,7 +1105,6 @@ describe("Config Validation - AutoDispatch", () => {
     expect(ad.pollInterval).toBe(5);
     expect(ad.maxConcurrent).toBe(3);
     expect(ad.maxDaily).toBe(20);
-    expect(ad.requireApproval).toBe(false);
     expect(ad.onNewIssue).toBe("spawn");
   });
 

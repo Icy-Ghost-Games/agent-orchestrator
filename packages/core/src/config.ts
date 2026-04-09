@@ -236,6 +236,7 @@ const DecomposerConfigSchema = z
   });
 
 const AutoDispatchFiltersSchema = z.object({
+  labels: z.array(z.string()).default(["ai-agent"]),
   minPriority: z.string().optional(),
   excludeLabels: z.array(z.string()).default([]),
   maxStoryPoints: z.number().positive().optional(),
@@ -246,9 +247,8 @@ const AutoDispatchSchema = z.object({
   pollInterval: z.number().min(1).max(60).default(5),
   maxConcurrent: z.number().min(1).max(50).default(3),
   maxDaily: z.number().min(1).max(100).default(20),
-  requireApproval: z.boolean().default(false),
   filters: AutoDispatchFiltersSchema.optional(),
-  onNewIssue: z.enum(["spawn", "queue", "notify"]).default("spawn"),
+  onNewIssue: z.enum(["spawn", "notify"]).default("spawn"),
 });
 
 const ProjectConfigSchema = z.object({

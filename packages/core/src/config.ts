@@ -235,6 +235,22 @@ const DecomposerConfigSchema = z
     requireApproval: true,
   });
 
+const AutoDispatchFiltersSchema = z.object({
+  minPriority: z.string().optional(),
+  excludeLabels: z.array(z.string()).default([]),
+  maxStoryPoints: z.number().positive().optional(),
+});
+
+const AutoDispatchSchema = z.object({
+  enabled: z.boolean().default(false),
+  pollInterval: z.number().min(1).max(60).default(5),
+  maxConcurrent: z.number().min(1).max(50).default(3),
+  maxDaily: z.number().min(1).max(100).default(20),
+  requireApproval: z.boolean().default(false),
+  filters: AutoDispatchFiltersSchema.optional(),
+  onNewIssue: z.enum(["spawn", "queue", "notify"]).default("spawn"),
+});
+
 const ProjectConfigSchema = z.object({
   name: z.string().optional(),
   repo: z.string(),
@@ -263,6 +279,7 @@ const ProjectConfigSchema = z.object({
     .optional(),
   opencodeIssueSessionStrategy: z.enum(["reuse", "delete", "ignore"]).optional(),
   decomposer: DecomposerConfigSchema.optional(),
+  autoDispatch: AutoDispatchSchema.optional(),
 });
 
 const DefaultPluginsSchema = z.object({

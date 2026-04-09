@@ -57,6 +57,10 @@ export type { SessionManagerDeps } from "./session-manager.js";
 export { createLifecycleManager } from "./lifecycle-manager.js";
 export type { LifecycleManagerDeps } from "./lifecycle-manager.js";
 
+// Auto-dispatcher — automatic work discovery & session spawning
+export { createAutoDispatcher } from "./auto-dispatcher.js";
+export type { AutoDispatcher, AutoDispatcherDeps, AutoDispatchEvent } from "./auto-dispatcher.js";
+
 // Prompt builder — layered prompt composition
 export { buildPrompt, BASE_AGENT_PROMPT } from "./prompt-builder.js";
 export type { PromptBuildConfig } from "./prompt-builder.js";

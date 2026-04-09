@@ -30,6 +30,7 @@ import {
   type Runtime,
   type Agent,
   type SCM,
+  type Tracker,
   type Notifier,
   type Session,
   type EventPriority,
@@ -37,6 +38,7 @@ import {
   type PREnrichmentData,
   type CICheck,
 } from "./types.js";
+import { createAutoDispatcher, type AutoDispatcher } from "./auto-dispatcher.js";
 import { updateMetadata } from "./metadata.js";
 import { getSessionsDir } from "./paths.js";
 import { createCorrelationId, createProjectObserver } from "./observability.js";
@@ -202,6 +204,7 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
   let polling = false; // re-entrancy guard
   let lastPollStartedAt = 0; // timestamp of last poll start (sleep/wake burst guard)
   let allCompleteEmitted = false; // guard against repeated all_complete
+  const dispatchers = new Map<string, AutoDispatcher>(); // projectId → dispatcher
 
   /**
    * Cache for PR enrichment data within a single poll cycle.
@@ -1370,6 +1373,10 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           try {
             await sessionManager.kill(session.id);
             states.delete(session.id);
+            // Unclaim the issue in the auto-dispatcher so it can be re-dispatched
+            if (session.issueId) {
+              dispatchers.get(session.projectId)?.unclaim(session.issueId);
+            }
             observer.recordOperation({
               metric: "lifecycle_poll",
               operation: "lifecycle.auto_cleanup",
@@ -1456,6 +1463,38 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
       pollTimer = setInterval(() => void pollAll(), intervalMs);
       // Run immediately on start
       void pollAll();
+
+      // Initialize auto-dispatchers for projects that have it enabled
+      for (const [projId, projectConfig] of Object.entries(config.projects)) {
+        // If scoped to a single project, skip others
+        if (scopedProjectId && projId !== scopedProjectId) continue;
+        if (!projectConfig.autoDispatch?.enabled) continue;
+
+        const trackerPlugin = projectConfig.tracker?.plugin;
+        if (!trackerPlugin) continue;
+        const trackerInstance = registry.get<Tracker>("tracker", trackerPlugin);
+        if (!trackerInstance) continue;
+
+        // Collect notifiers for this project
+        const notifierInstances: Notifier[] = [];
+        for (const name of config.defaults.notifiers) {
+          const n = registry.get<Notifier>("notifier", name);
+          if (n) notifierInstances.push(n);
+        }
+
+        const dispatcher = createAutoDispatcher({
+          config: projectConfig.autoDispatch,
+          orchestratorConfig: config,
+          projectId: projId,
+          project: projectConfig,
+          tracker: trackerInstance,
+          sessionManager,
+          notifiers: notifierInstances,
+          observer,
+        });
+        dispatcher.start();
+        dispatchers.set(projId, dispatcher);
+      }
     },
 
     stop(): void {
@@ -1463,10 +1502,19 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
         clearInterval(pollTimer);
         pollTimer = null;
       }
+      // Stop all auto-dispatchers
+      for (const dispatcher of dispatchers.values()) {
+        dispatcher.stop();
+      }
+      dispatchers.clear();
     },
 
     getStates(): Map<SessionId, SessionStatus> {
       return new Map(states);
+    },
+
+    getDispatchers(): ReadonlyMap<string, AutoDispatcher> {
+      return dispatchers;
     },
 
     async check(sessionId: SessionId): Promise<void> {

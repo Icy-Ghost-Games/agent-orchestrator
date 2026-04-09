@@ -1197,6 +1197,41 @@ export interface ProjectConfig {
     /** Require human approval before executing decomposed plans (default: true) */
     requireApproval: boolean;
   };
+
+  /** Auto-dispatch scheduler configuration */
+  autoDispatch?: AutoDispatchConfig;
+}
+
+// =============================================================================
+// AUTO-DISPATCH
+// =============================================================================
+
+/** Filtering criteria for auto-dispatch issue selection */
+export interface AutoDispatchFilters {
+  /** Only issues with ALL of these labels are eligible (default: ["ai-agent"]) */
+  labels: string[];
+  /** Minimum priority level name (issues below this are skipped) */
+  minPriority?: string;
+  /** Issues with any of these labels are excluded */
+  excludeLabels: string[];
+  /** Issues above this story point threshold are skipped */
+  maxStoryPoints?: number;
+}
+
+/** Configuration for the auto-dispatch scheduler */
+export interface AutoDispatchConfig {
+  /** Whether auto-dispatch is enabled (default: false) */
+  enabled: boolean;
+  /** Minutes between tracker polls (min: 1, max: 60, default: 5) */
+  pollInterval: number;
+  /** Max simultaneous sessions for this project (default: 3) */
+  maxConcurrent: number;
+  /** Max sessions spawned per calendar day — cost guard (default: 20) */
+  maxDaily: number;
+  /** Additional filters beyond the tracker query */
+  filters?: AutoDispatchFilters;
+  /** What to do when a new eligible issue is found (default: "spawn") */
+  onNewIssue: "spawn" | "notify";
 }
 
 export interface TrackerConfig {
@@ -1453,6 +1488,10 @@ export interface LifecycleManager {
 
   /** Get current state for all sessions */
   getStates(): Map<SessionId, SessionStatus>;
+
+  /** Get auto-dispatchers by project ID (empty if none are enabled) */
+  getDispatchers(): ReadonlyMap<string, import("./auto-dispatcher.js").AutoDispatcher>;
+
 
   /** Force-check a specific session now */
   check(sessionId: SessionId): Promise<void>;

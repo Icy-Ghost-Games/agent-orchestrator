@@ -1087,3 +1087,65 @@ describe("External Plugin Name Generation", () => {
     expect(config.projects.proj1.scm?.plugin).toBe("azure-devops");
   });
 });
+
+describe("Config Validation - AutoDispatch", () => {
+  it("accepts valid autoDispatch config with defaults", () => {
+    const config = validateConfig({
+      projects: {
+        app: {
+          path: "/tmp/app",
+          repo: "org/app",
+          autoDispatch: { enabled: true },
+        },
+      },
+    });
+
+    const ad = config.projects.app.autoDispatch!;
+    expect(ad.enabled).toBe(true);
+    expect(ad.pollInterval).toBe(5);
+    expect(ad.maxConcurrent).toBe(3);
+    expect(ad.maxDaily).toBe(20);
+    expect(ad.onNewIssue).toBe("spawn");
+  });
+
+  it("rejects pollInterval below 1", () => {
+    expect(() =>
+      validateConfig({
+        projects: {
+          app: {
+            path: "/tmp/app",
+            repo: "org/app",
+            autoDispatch: { enabled: true, pollInterval: 0 },
+          },
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects pollInterval above 60", () => {
+    expect(() =>
+      validateConfig({
+        projects: {
+          app: {
+            path: "/tmp/app",
+            repo: "org/app",
+            autoDispatch: { enabled: true, pollInterval: 120 },
+          },
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("configs without autoDispatch still work", () => {
+    const config = validateConfig({
+      projects: {
+        app: {
+          path: "/tmp/app",
+          repo: "org/app",
+        },
+      },
+    });
+
+    expect(config.projects.app.autoDispatch).toBeUndefined();
+  });
+});

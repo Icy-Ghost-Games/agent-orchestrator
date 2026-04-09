@@ -206,6 +206,11 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore, onCleanu
           <span className="font-[var(--font-mono)] text-[10px] tracking-wide text-[var(--color-text-muted)]">
             {session.id}
           </span>
+          {session.metadata?.autoDispatched && (
+            <span className="inline-flex items-center px-1 py-0 text-[8px] font-semibold uppercase tracking-wider border border-[color-mix(in_srgb,var(--color-accent)_30%,transparent)] text-[var(--color-accent)] bg-[color-mix(in_srgb,var(--color-accent)_6%,transparent)]">
+              auto
+            </span>
+          )}
           <div className="flex-1" />
           {isRestorable && (
             <button
@@ -436,6 +441,11 @@ function SessionCardView({ session, onSend, onKill, onMerge, onRestore, onCleanu
         <span className="font-[var(--font-mono)] text-[11px] tracking-wide text-[var(--color-text-muted)]">
           {session.id}
         </span>
+        {session.metadata?.autoDispatched && (
+          <span className="inline-flex items-center px-1.5 py-0 text-[9px] font-semibold uppercase tracking-wider border border-[color-mix(in_srgb,var(--color-accent)_30%,transparent)] text-[var(--color-accent)] bg-[color-mix(in_srgb,var(--color-accent)_6%,transparent)]">
+            auto
+          </span>
+        )}
         <div className="flex-1" />
         {isRestorable && (
           <button

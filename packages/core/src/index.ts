@@ -1,5 +1,5 @@
 /**
- * @composio/ao-core
+ * @aoagents/ao-core
  *
  * Core library for the Agent Orchestrator.
  * Exports all types, config loader, and service implementations.
@@ -33,9 +33,76 @@ export {
   readMetadataRaw,
   writeMetadata,
   updateMetadata,
+  readCanonicalLifecycle,
+  writeCanonicalLifecycle,
+  updateCanonicalLifecycle,
   deleteMetadata,
   listMetadata,
 } from "./metadata.js";
+export { createInitialCanonicalLifecycle, deriveLegacyStatus } from "./lifecycle-state.js";
+export { sessionFromMetadata } from "./utils/session-from-metadata.js";
+
+// Lifecycle transitions — centralized transition boundary (#137)
+export {
+  applyLifecycleDecision,
+  applyDecisionToLifecycle,
+  buildTransitionMetadataPatch,
+  createStateTransitionDecision,
+} from "./lifecycle-transition.js";
+export type {
+  TransitionSource,
+  TransitionResult,
+  ApplyDecisionInput,
+} from "./lifecycle-transition.js";
+
+// Lifecycle status decisions — pure decision helpers (#136)
+export {
+  DETECTING_MAX_ATTEMPTS,
+  DETECTING_MAX_DURATION_MS,
+  hashEvidence,
+  isDetectingTimedOut,
+} from "./lifecycle-status-decisions.js";
+
+// Report watcher — background trigger system for agent reports (#140)
+export {
+  auditAgentReports,
+  checkAcknowledgeTimeout,
+  checkStaleReport,
+  checkBlockedAgent,
+  shouldAuditSession,
+  getReactionKeyForTrigger,
+  DEFAULT_REPORT_WATCHER_CONFIG,
+  REPORT_WATCHER_METADATA_KEYS,
+} from "./report-watcher.js";
+export type {
+  ReportWatcherTrigger,
+  ReportAuditResult,
+  ReportWatcherConfig,
+} from "./report-watcher.js";
+
+// Agent reports — explicit workflow transitions declared by worker agents (Stage 3)
+export {
+  AGENT_REPORTED_STATES,
+  AGENT_REPORT_METADATA_KEYS,
+  AGENT_REPORT_FRESHNESS_MS,
+  applyAgentReport,
+  readAgentReport,
+  readAgentReportAuditTrail,
+  readAgentReportAuditTrailAsync,
+  isAgentReportFresh,
+  mapAgentReportToLifecycle,
+  normalizeAgentReportedState,
+  validateAgentReportTransition,
+} from "./agent-report.js";
+export type {
+  AgentReport,
+  AgentReportAuditEntry,
+  AgentReportAuditSnapshot,
+  AgentReportedState,
+  ApplyAgentReportInput,
+  ApplyAgentReportResult,
+  AgentReportTransitionResult,
+} from "./agent-report.js";
 
 // tmux — command wrappers
 export {
@@ -58,46 +125,19 @@ export { createLifecycleManager } from "./lifecycle-manager.js";
 export type { LifecycleManagerDeps } from "./lifecycle-manager.js";
 
 // Prompt builder — layered prompt composition
-export { buildPrompt, BASE_AGENT_PROMPT } from "./prompt-builder.js";
+export { buildPrompt, BASE_AGENT_PROMPT, BASE_AGENT_PROMPT_NO_REPO } from "./prompt-builder.js";
 export type { PromptBuildConfig } from "./prompt-builder.js";
-
-// Decomposer — LLM-driven task decomposition
-export {
-  decompose,
-  getLeaves,
-  getSiblings,
-  formatPlanTree,
-  formatLineage,
-  formatSiblings,
-  propagateStatus,
-  DEFAULT_DECOMPOSER_CONFIG,
-} from "./decomposer.js";
-export type {
-  TaskNode,
-  TaskKind,
-  TaskStatus,
-  DecompositionPlan,
-  DecomposerConfig,
-} from "./decomposer.js";
 
 // Orchestrator prompt — generates orchestrator context for `ao start`
 export { generateOrchestratorPrompt } from "./orchestrator-prompt.js";
 export type { OrchestratorPromptConfig } from "./orchestrator-prompt.js";
-
-
-// Global pause constants and utilities
-export {
-  GLOBAL_PAUSE_UNTIL_KEY,
-  GLOBAL_PAUSE_REASON_KEY,
-  GLOBAL_PAUSE_SOURCE_KEY,
-  parsePauseUntil,
-} from "./global-pause.js";
 
 // Shared utilities
 export {
   shellEscape,
   escapeAppleScript,
   validateUrl,
+  isGitBranchNameSafe,
   isRetryableHttpStatus,
   normalizeRetryConfig,
   readLastJsonlEntry,
@@ -110,6 +150,10 @@ export {
   parseWebhookBranchRef,
 } from "./scm-webhook-utils.js";
 export { asValidOpenCodeSessionId } from "./opencode-session-id.js";
+export {
+  getWorkspaceAgentsMdPath,
+  writeWorkspaceOpenCodeAgentsMd,
+} from "./opencode-agents-md.js";
 export { normalizeOrchestratorSessionStrategy } from "./orchestrator-session-strategy.js";
 
 // Activity log — JSONL activity tracking for agents without native JSONL
@@ -121,6 +165,17 @@ export {
   classifyTerminalActivity,
   recordTerminalActivity,
 } from "./activity-log.js";
+export {
+  ACTIVITY_STRONG_WINDOW_MS,
+  ACTIVITY_WEAK_WINDOW_MS,
+  classifyActivitySignal,
+  createActivitySignal,
+  formatActivitySignalEvidence,
+  hasPositiveIdleEvidence,
+  isWeakActivityEvidence,
+  summarizeActivityFreshness,
+  supportsRecentLiveness,
+} from "./activity-signal.js";
 
 // Agent workspace hooks — shared PATH-wrapper setup for non-Claude agents
 export {
@@ -135,6 +190,7 @@ export {
   createProjectObserver,
   readObservabilitySummary,
 } from "./observability.js";
+export { resolveNotifierTarget } from "./notifier-resolution.js";
 export type {
   ObservabilityMetricName,
   ObservabilityHealthStatus,

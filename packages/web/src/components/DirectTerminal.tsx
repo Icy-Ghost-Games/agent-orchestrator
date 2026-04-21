@@ -4,73 +4,89 @@ import { useEffect, useRef, useState, useMemo } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/cn";
+import { useMux } from "@/hooks/useMux";
+import { attachTouchScroll } from "@/lib/terminal-touch-scroll";
 
 // Import xterm CSS (must be imported in client component)
-import "xterm/css/xterm.css";
+import "@xterm/xterm/css/xterm.css";
 
-// Dynamically import xterm types for TypeScript
-import type { ITheme, Terminal as TerminalType } from "xterm";
+// Static type-only imports (erased at compile time, no SSR impact).
+// The runtime Terminal class is loaded via dynamic import() inside useEffect to avoid SSR.
+import type { ITheme, Terminal as TerminalType } from "@xterm/xterm";
 import type { FitAddon as FitAddonType } from "@xterm/addon-fit";
+
+// Font size constants
+const FONT_SIZE_KEY = "ao-terminal-font-size";
+const FONT_SIZE_MIN = 9;
+const FONT_SIZE_MAX = 18;
+const FONT_SIZE_DEFAULT = 13;
+
+// Fallback mono stack used when the CSS custom property isn't resolvable yet.
+const MONO_FONT_FALLBACK =
+  '"JetBrains Mono", "SF Mono", Menlo, Monaco, "Courier New", monospace';
+
+/**
+ * Resolve the app's configured mono font token to a concrete font-family string.
+ *
+ * xterm's internal char-size measurement ultimately hits canvas ctx.font, which
+ * cannot evaluate `var(...)`. Reading `--font-jetbrains-mono` with
+ * getComputedStyle gives us the generated next/font family name (e.g.
+ * `__JetBrains_Mono_abc123`), which we can safely feed into xterm while still
+ * honouring the app's font configuration.
+ *
+ * NOTE: we deliberately read `--font-jetbrains-mono` and NOT `--font-mono`.
+ * `--font-mono` in globals.css is itself a composed stack that contains
+ * `var(--font-jetbrains-mono)` — if we forwarded that to xterm, the raw
+ * `var(...)` token would end up back in canvas ctx.font and reintroduce the
+ * original measurement bug this helper exists to fix.
+ *
+ * Exported for unit testing.
+ */
+export function resolveMonoFontFamily(): string {
+  if (typeof window === "undefined") return MONO_FONT_FALLBACK;
+  try {
+    const resolved = getComputedStyle(document.documentElement)
+      .getPropertyValue("--font-jetbrains-mono")
+      .trim();
+    return resolved ? `${resolved}, ${MONO_FONT_FALLBACK}` : MONO_FONT_FALLBACK;
+  } catch {
+    return MONO_FONT_FALLBACK;
+  }
+}
+
+function getStoredFontSize(): number {
+  if (typeof window === "undefined") return FONT_SIZE_DEFAULT;
+  try {
+    const stored = localStorage.getItem(FONT_SIZE_KEY);
+    if (stored) {
+      const size = parseInt(stored, 10);
+      if (!Number.isNaN(size)) {
+        return Math.max(FONT_SIZE_MIN, Math.min(FONT_SIZE_MAX, size));
+      }
+    }
+  } catch {
+    // localStorage might be unavailable
+  }
+  return FONT_SIZE_DEFAULT;
+}
 
 interface DirectTerminalProps {
   sessionId: string;
   startFullscreen?: boolean;
   /** Visual variant. Orchestrator keeps the same design-system blue accent as the rest of the app. */
   variant?: "agent" | "orchestrator";
-  /** CSS height for the terminal container in normal (non-fullscreen) mode.
-   *  Defaults to "max(440px, calc(100vh - 440px))". */
+  appearance?: "theme" | "dark";
+  /** @deprecated Terminal now fills its flex parent via flex:1. This prop is ignored. */
   height?: string;
   isOpenCodeSession?: boolean;
   reloadCommand?: string;
-}
-
-interface DirectTerminalLocation {
-  protocol: string;
-  hostname: string;
-  host: string;
-  port: string;
-}
-
-interface DirectTerminalWsUrlOptions {
-  location: DirectTerminalLocation;
-  sessionId: string;
-  proxyWsPath?: string;
-  directTerminalPort?: string;
-}
-
-interface RuntimeTerminalConfigResponse {
-  directTerminalPort?: unknown;
-  proxyWsPath?: unknown;
-}
-
-interface TerminalConnectionConfig {
-  directTerminalPort?: string;
-  proxyWsPath?: string;
+  chromeless?: boolean;
+  /** When true, focus the terminal immediately after it mounts so keyboard input works without clicking first. */
+  autoFocus?: boolean;
 }
 
 type TerminalVariant = "agent" | "orchestrator";
 
-function normalizePortValue(value: unknown): string | undefined {
-  if (typeof value !== "string" && typeof value !== "number") return undefined;
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 65535) return undefined;
-  return String(parsed);
-}
-
-function normalizePathValue(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  if (!trimmed.startsWith("/")) return undefined;
-  return trimmed;
-}
-
-function parseRuntimeTerminalConfig(payload: unknown): TerminalConnectionConfig {
-  const response = (payload ?? {}) as RuntimeTerminalConfigResponse;
-  return {
-    directTerminalPort: normalizePortValue(response.directTerminalPort),
-    proxyWsPath: normalizePathValue(response.proxyWsPath),
-  };
-}
 
 export function buildTerminalThemes(variant: TerminalVariant): { dark: ITheme; light: ITheme } {
   const agentAccent = {
@@ -136,26 +152,6 @@ export function buildTerminalThemes(variant: TerminalVariant): { dark: ITheme; l
   return { dark, light };
 }
 
-export function buildDirectTerminalWsUrl({
-  location,
-  sessionId,
-  proxyWsPath,
-  directTerminalPort,
-}: DirectTerminalWsUrlOptions): string {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  if (proxyWsPath) {
-    // Path-based proxy uses host so non-standard ports are preserved.
-    return `${protocol}//${location.host}${proxyWsPath}?session=${encodeURIComponent(sessionId)}`;
-  }
-
-  if (location.port === "" || location.port === "443" || location.port === "80") {
-    return `${protocol}//${location.hostname}/ao-terminal-ws?session=${encodeURIComponent(sessionId)}`;
-  }
-
-  const port = directTerminalPort ?? "14801";
-  return `${protocol}//${location.hostname}:${port}/ws?session=${encodeURIComponent(sessionId)}`;
-}
-
 /**
  * Direct xterm.js terminal with native WebSocket connection.
  * Implements Extended Device Attributes (XDA) handler to enable
@@ -170,28 +166,32 @@ export function DirectTerminal({
   sessionId,
   startFullscreen = false,
   variant = "agent",
-  height = "max(440px, calc(100dvh - 440px))",
+  appearance = "theme",
+  height: _height = "max(440px, calc(100dvh - 440px))",
   isOpenCodeSession = false,
   reloadCommand,
+  chromeless = false,
+  autoFocus = false,
 }: DirectTerminalProps) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const { resolvedTheme } = useTheme();
   const terminalThemes = useMemo(() => buildTerminalThemes(variant), [variant]);
+  const { subscribeTerminal, writeTerminal, resizeTerminal: resizeTerminalMux, openTerminal, closeTerminal, status: muxStatus } = useMux();
 
   const terminalRef = useRef<HTMLDivElement>(null);
   const terminalInstance = useRef<TerminalType | null>(null);
   const fitAddon = useRef<FitAddonType | null>(null);
-  const ws = useRef<WebSocket | null>(null);
-  const reconnectAttemptRef = useRef(0);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const permanentErrorRef = useRef(false);
+  const muxStatusRef = useRef(muxStatus);
+  muxStatusRef.current = muxStatus;
   const [fullscreen, setFullscreen] = useState(startFullscreen);
-  const [status, setStatus] = useState<"connecting" | "connected" | "error">("connecting");
   const [error, setError] = useState<string | null>(null);
   const [reloading, setReloading] = useState(false);
   const [reloadError, setReloadError] = useState<string | null>(null);
+  const [fontSize, setFontSize] = useState(getStoredFontSize());
+  const followOutputRef = useRef(true);
+  const [followOutput, setFollowOutput] = useState(true);
 
   // Update URL when fullscreen changes
   useEffect(() => {
@@ -249,20 +249,14 @@ export function DirectTerminal({
   useEffect(() => {
     if (!terminalRef.current) return;
 
-    // Reset reconnection state when sessionId changes
-    permanentErrorRef.current = false;
-    reconnectAttemptRef.current = 0;
-
     // Dynamically import xterm.js to avoid SSR issues
     let mounted = true;
     let cleanup: (() => void) | null = null;
     let inputDisposable: { dispose(): void } | null = null;
-
-    const PERMANENT_CLOSE_CODES = new Set([4001, 4004]); // auth failure, session not found
-    const MAX_RECONNECT_DELAY = 15_000;
+    let unsubscribe: (() => void) | null = null;
 
     Promise.all([
-      import("xterm").then((mod) => mod.Terminal),
+      import("@xterm/xterm").then((mod) => mod.Terminal),
       import("@xterm/addon-fit").then((mod) => mod.FitAddon),
       import("@xterm/addon-web-links").then((mod) => mod.WebLinksAddon),
       document.fonts.ready,
@@ -270,22 +264,27 @@ export function DirectTerminal({
       .then(([Terminal, FitAddon, WebLinksAddon]) => {
         if (!mounted || !terminalRef.current) return;
 
-        const isDark = resolvedTheme !== "light";
+        const isDark = appearance === "dark" || resolvedTheme !== "light";
         const activeTheme = isDark ? terminalThemes.dark : terminalThemes.light;
 
         // Initialize xterm.js Terminal
+        // NOTE: xterm's internal char-size measurement uses canvas ctx.font which
+        // cannot resolve `var(...)`. resolveMonoFontFamily() reads the CSS custom
+        // property at runtime so we still honour the app's configured font token
+        // (next/font generated name) while handing xterm a concrete string.
         const terminal = new Terminal({
           cursorBlink: true,
-          fontSize: 13,
-          fontFamily:
-            'var(--font-jetbrains-mono), "JetBrains Mono", "SF Mono", Menlo, Monaco, "Courier New", monospace',
+          fontSize: fontSize,
+          fontFamily: resolveMonoFontFamily(),
+          // xterm v6 default lineHeight (1.0) collides rows with JetBrains Mono's
+          // tall x-height. 1.2 restores visual breathing room between lines.
+          lineHeight: 1.2,
           theme: activeTheme,
           // Light mode needs an explicit contrast floor because agent UIs often emit
           // dim/faint ANSI sequences that become unreadable on a near-white background.
           minimumContrastRatio: isDark ? 1 : 7,
           scrollback: 10000,
           allowProposedApi: true,
-          fastScrollModifier: "alt",
           fastScrollSensitivity: 3,
           scrollSensitivity: 1,
         });
@@ -337,13 +336,82 @@ export function DirectTerminal({
         terminal.open(terminalRef.current);
         terminalInstance.current = terminal;
 
+        if (autoFocus) {
+          terminal.focus();
+        }
+
         // Fit terminal to container
         fit.fit();
 
-        // Runtime WS config cache. We do not rely on build-time NEXT_PUBLIC_* here
-        // because `ao start` can choose terminal ports dynamically at runtime.
-        const runtimeConnectionConfig: TerminalConnectionConfig = {};
-        let runtimeFetchDone = false;
+        // Deferred fit to handle cases where container wasn't sized yet
+        const deferredFitTimeout = setTimeout(() => {
+          if (mounted && fitAddon.current) {
+            try {
+              fitAddon.current.fit();
+              resizeTerminalMux(sessionId, terminal.cols, terminal.rows);
+            } catch {
+              // Ignore fit errors
+            }
+          }
+        }, 100);
+
+        // Re-measure when webfonts finish loading. next/font uses font-display:swap,
+        // so document.fonts.ready can resolve before JetBrains Mono actually swaps
+        // in. Without this, xterm's initial cell measurement stays pinned to the
+        // fallback font — producing wide-looking horizontal cells once the real
+        // font swaps. Listening to 'loadingdone' forces a re-fit when the swap
+        // actually completes.
+        const handleFontsLoadingDone = () => {
+          if (!mounted || !fitAddon.current || !terminalInstance.current) return;
+          try {
+            // Re-resolve the CSS var in case next/font registered its family
+            // name after initial construction, then force a re-measure.
+            terminalInstance.current.options.fontFamily = resolveMonoFontFamily();
+            terminalInstance.current.clearTextureAtlas?.();
+            fitAddon.current.fit();
+            resizeTerminalMux(sessionId, terminalInstance.current.cols, terminalInstance.current.rows);
+          } catch {
+            // Ignore fit errors
+          }
+        };
+        // Feature-detect `FontFaceSet.addEventListener` — it's missing in
+        // jsdom's `document.fonts` mock and some older runtimes. Without the
+        // guard, init throws a TypeError and the terminal never attaches.
+        const fontsFace =
+          typeof document !== "undefined" ? document.fonts : undefined;
+        const fontsListenerAttached =
+          !!fontsFace && typeof fontsFace.addEventListener === "function";
+        if (fontsListenerAttached) {
+          fontsFace!.addEventListener("loadingdone", handleFontsLoadingDone);
+        }
+
+        // Grab viewport element for manual follow-output scroll
+        const viewport = terminal.element?.querySelector<HTMLElement>(".xterm-viewport") ?? null;
+
+        // Attach touch scroll for mobile — disable follow-output while user is scrolling
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const cleanupTouchScroll = attachTouchScroll(terminal as any, (data) => {
+          writeTerminal(sessionId, data);
+        }, {
+          onScrollAway: () => { followOutputRef.current = false; setFollowOutput(false); },
+          onScrollTowardLatest: () => { followOutputRef.current = true; setFollowOutput(true); },
+        });
+
+        // Set up ResizeObserver to handle flex layout changes
+        let resizeObserver: ResizeObserver | null = null;
+        if (terminalRef.current) {
+          resizeObserver = new ResizeObserver(() => {
+            if (mounted && fitAddon.current) {
+              try {
+                fitAddon.current.fit();
+                resizeTerminalMux(sessionId, terminal.cols, terminal.rows);
+              } catch {
+                // Ignore fit errors
+              }
+            }
+          });
+          resizeObserver.observe(terminalRef.current);
+        }
 
         // ── Preserve selection while terminal receives output ────────
         // xterm.js clears the selection on every terminal.write(). We
@@ -404,197 +472,156 @@ export function DirectTerminal({
           return true;
         });
 
-        // Handle window resize (works with whatever ws is current)
+        // Open terminal via mux
+        openTerminal(sessionId);
+
+        // Subscribe to terminal data via mux
+        unsubscribe = subscribeTerminal(sessionId, (data) => {
+          if (selectionActive) {
+            writeBuffer.push(data);
+            bufferBytes += data.length;
+            // Flush if buffer exceeds 1 MB to prevent OOM
+            if (bufferBytes > MAX_BUFFER_BYTES) {
+              selectionActive = false;
+              flushWriteBuffer();
+            }
+          } else {
+            terminal.write(data);
+            if (followOutputRef.current && viewport) {
+              programmaticScroll = true;
+              viewport.scrollTop = viewport.scrollHeight;
+            }
+          }
+        });
+
+        // Track whether our own write()-driven scrollTop change triggered this event
+        let programmaticScroll = false;
+        const handleViewportScroll = () => {
+          if (!viewport) return;
+          if (programmaticScroll) {
+            programmaticScroll = false;
+            return;
+          }
+          const distFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+          if (distFromBottom < 24) {
+            followOutputRef.current = true;
+            setFollowOutput(true);
+          } else {
+            followOutputRef.current = false;
+            setFollowOutput(false);
+          }
+        };
+        viewport?.addEventListener("scroll", handleViewportScroll, { passive: true });
+
+        // Handle window resize
         const handleResize = () => {
-          const currentWs = ws.current;
-          if (fit && currentWs?.readyState === WebSocket.OPEN) {
+          if (fit) {
             fit.fit();
-            currentWs.send(
-              JSON.stringify({
-                type: "resize",
-                cols: terminal.cols,
-                rows: terminal.rows,
-              }),
-            );
+            resizeTerminalMux(sessionId, terminal.cols, terminal.rows);
           }
         };
 
         window.addEventListener("resize", handleResize);
 
-        // Terminal input → current WebSocket
+        // Terminal input → mux
         inputDisposable = terminal.onData((data) => {
-          if (ws.current?.readyState === WebSocket.OPEN) {
-            ws.current.send(data);
-          }
+          writeTerminal(sessionId, data);
         });
 
-        async function resolveConnectionConfig(): Promise<TerminalConnectionConfig> {
-          const fromBuild: TerminalConnectionConfig = {
-            proxyWsPath: normalizePathValue(process.env.NEXT_PUBLIC_TERMINAL_WS_PATH),
-            directTerminalPort: normalizePortValue(process.env.NEXT_PUBLIC_DIRECT_TERMINAL_PORT),
-          };
-
-          if (!fromBuild.proxyWsPath && !runtimeFetchDone) {
-            runtimeFetchDone = true;
-            const controller = new AbortController();
-            const fetchTimeout = setTimeout(() => controller.abort(), 1500);
-            try {
-              const response = await fetch("/api/runtime/terminal", {
-                cache: "no-store",
-                signal: controller.signal,
-              });
-              if (response.ok) {
-                const runtimeConfig = parseRuntimeTerminalConfig(await response.json());
-                runtimeConnectionConfig.proxyWsPath = runtimeConfig.proxyWsPath;
-                runtimeConnectionConfig.directTerminalPort = runtimeConfig.directTerminalPort;
-              }
-            } catch {
-              // Runtime config endpoint is optional (timeout or network failure); fallback to build-time values.
-            } finally {
-              clearTimeout(fetchTimeout);
-            }
-          }
-
-          return {
-            proxyWsPath: runtimeConnectionConfig.proxyWsPath ?? fromBuild.proxyWsPath,
-            directTerminalPort:
-              runtimeConnectionConfig.directTerminalPort ?? fromBuild.directTerminalPort,
-          };
-        }
-
-        async function connectWebSocket() {
-          if (!mounted) return;
-
-          const config = await resolveConnectionConfig();
-          if (!mounted) return;
-
-          const wsUrl = buildDirectTerminalWsUrl({
-            location: window.location,
-            sessionId,
-            proxyWsPath: config.proxyWsPath,
-            directTerminalPort: config.directTerminalPort,
-          });
-
-          console.log("[DirectTerminal] Connecting to:", wsUrl);
-          const websocket = new WebSocket(wsUrl);
-          ws.current = websocket;
-          websocket.binaryType = "arraybuffer";
-
-          websocket.onopen = () => {
-            console.log("[DirectTerminal] WebSocket connected");
-            reconnectAttemptRef.current = 0;
-            setStatus("connected");
-            setError(null);
-
-            // Send initial size
-            websocket.send(
-              JSON.stringify({
-                type: "resize",
-                cols: terminal.cols,
-                rows: terminal.rows,
-              }),
-            );
-          };
-
-          websocket.onmessage = (event) => {
-            const data =
-              typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data);
-            if (selectionActive) {
-              writeBuffer.push(data);
-              bufferBytes += data.length;
-              // Flush if buffer exceeds 1 MB to prevent OOM
-              if (bufferBytes > MAX_BUFFER_BYTES) {
-                selectionActive = false;
-                flushWriteBuffer();
-              }
-            } else {
-              terminal.write(data);
-            }
-          };
-
-          websocket.onerror = (event) => {
-            console.error("[DirectTerminal] WebSocket error:", event);
-          };
-
-          websocket.onclose = (event) => {
-            console.log("[DirectTerminal] WebSocket closed:", event.code, event.reason);
-
-            if (!mounted) return;
-
-            // Permanent errors — don't retry
-            if (PERMANENT_CLOSE_CODES.has(event.code)) {
-              permanentErrorRef.current = true;
-              setStatus("error");
-              setError(event.reason || `Connection refused (${event.code})`);
-              return;
-            }
-
-            // Transient failure — schedule reconnect with exponential backoff
-            const attempt = reconnectAttemptRef.current;
-            const delay = Math.min(1000 * Math.pow(2, attempt), MAX_RECONNECT_DELAY);
-            reconnectAttemptRef.current = attempt + 1;
-
-            console.log(`[DirectTerminal] Reconnecting in ${delay}ms (attempt ${attempt + 1})`);
-            setStatus("connecting");
-            setError(null);
-
-            reconnectTimerRef.current = setTimeout(() => {
-              void connectWebSocket();
-            }, delay);
-          };
-        }
-
-        void connectWebSocket();
+        // Send initial size
+        resizeTerminalMux(sessionId, terminal.cols, terminal.rows);
 
         // Store cleanup function to be called from useEffect cleanup
         cleanup = () => {
+          clearTimeout(deferredFitTimeout);
+          resizeObserver?.disconnect();
+          cleanupTouchScroll();
           selectionDisposable.dispose();
           if (safetyTimer) clearTimeout(safetyTimer);
           window.removeEventListener("resize", handleResize);
+          if (fontsListenerAttached && fontsFace) {
+            fontsFace.removeEventListener("loadingdone", handleFontsLoadingDone);
+          }
+          viewport?.removeEventListener("scroll", handleViewportScroll);
           inputDisposable?.dispose();
           inputDisposable = null;
-          if (reconnectTimerRef.current) {
-            clearTimeout(reconnectTimerRef.current);
-            reconnectTimerRef.current = null;
-          }
-          ws.current?.close();
+          unsubscribe?.();
+          closeTerminal(sessionId);
           terminal.dispose();
         };
       })
       .catch((err) => {
         console.error("[DirectTerminal] Failed to load xterm.js:", err);
-        permanentErrorRef.current = true;
-        setStatus("error");
         setError("Failed to load terminal");
       });
 
     return () => {
       mounted = false;
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
       cleanup?.();
     };
-  }, [sessionId, variant]);
+    // fontSize intentionally NOT in deps — it's handled by a dedicated effect
+    // below that mutates terminal.options.fontSize in place. Adding it here
+    // would tear down and recreate the terminal (and WebSocket) on every
+    // stepper click, losing scrollback and flashing content.
+  }, [
+    appearance,
+    sessionId,
+    variant,
+    resolvedTheme,
+    terminalThemes,
+    subscribeTerminal,
+    writeTerminal,
+    resizeTerminalMux,
+    openTerminal,
+    closeTerminal,
+  ]);
+
+  // Re-send terminal dimensions on every reconnect so the server-side PTY
+  // matches the client's xterm.js size (new PTYs spawn at 80×24 default).
+  useEffect(() => {
+    if (muxStatus !== "connected") return;
+    const fit = fitAddon.current;
+    const terminal = terminalInstance.current;
+    if (!fit || !terminal) return;
+    fit.fit();
+    resizeTerminalMux(sessionId, terminal.cols, terminal.rows);
+  }, [muxStatus, sessionId, resizeTerminalMux]);
 
   // Live theme switching without terminal recreation
   useEffect(() => {
     const terminal = terminalInstance.current;
     if (!terminal) return;
-    const isDark = resolvedTheme !== "light";
+    const isDark = appearance === "dark" || resolvedTheme !== "light";
     terminal.options.theme = isDark ? terminalThemes.dark : terminalThemes.light;
     terminal.options.minimumContrastRatio = isDark ? 1 : 7;
-  }, [resolvedTheme, terminalThemes]);
+  }, [appearance, resolvedTheme, terminalThemes]);
+
+  // Font size change effect
+  useEffect(() => {
+    const terminal = terminalInstance.current;
+    const fit = fitAddon.current;
+    if (!terminal || !fit) return;
+    terminal.options.fontSize = fontSize;
+    try {
+      localStorage.setItem(FONT_SIZE_KEY, String(fontSize));
+    } catch {
+      // localStorage might be unavailable
+    }
+    // Re-fit locally AND tell the server-side PTY about the new cols/rows.
+    // Without the mux resize, the shell keeps wrapping at the old dimensions
+    // and the rendered output stops matching the visible grid until the
+    // next resize event (window resize, tab switch, etc.).
+    fit.fit();
+    resizeTerminalMux(sessionId, terminal.cols, terminal.rows);
+  }, [fontSize, sessionId, resizeTerminalMux]);
 
   // Re-fit terminal when fullscreen changes
   useEffect(() => {
     const fit = fitAddon.current;
     const terminal = terminalInstance.current;
-    const websocket = ws.current;
     const container = terminalRef.current;
 
-    if (!fit || !terminal || !websocket || websocket.readyState !== WebSocket.OPEN || !container) {
+    if (!fit || !terminal || muxStatusRef.current !== "connected" || !container) {
       return;
     }
 
@@ -624,17 +651,8 @@ export function DirectTerminal({
       fit.fit();
       terminal.refresh(0, terminal.rows - 1);
 
-      // Send new size to server (use ws.current in case WebSocket reconnected)
-      const currentWs = ws.current;
-      if (currentWs?.readyState === WebSocket.OPEN) {
-        currentWs.send(
-          JSON.stringify({
-            type: "resize",
-            cols: terminal.cols,
-            rows: terminal.rows,
-          }),
-        );
-      }
+      // Send new size to server via mux
+      resizeTerminalMux(sessionId, terminal.cols, terminal.rows);
     };
 
     // Start resize polling
@@ -676,149 +694,258 @@ export function DirectTerminal({
       clearTimeout(timer1);
       clearTimeout(timer2);
     };
-  }, [fullscreen]);
+  }, [fullscreen, sessionId, resizeTerminalMux]);
 
   const accentColor = "var(--color-accent)";
 
+  // Local errors (e.g. xterm.js load failure) take priority over mux connection state
+  const displayStatus = error ? "error" : muxStatus;
+
   const statusDotClass =
-    status === "connected"
+    displayStatus === "connected"
       ? "bg-[var(--color-status-ready)]"
-      : status === "error"
+      : displayStatus === "error" || displayStatus === "disconnected"
         ? "bg-[var(--color-status-error)]"
         : "bg-[var(--color-status-attention)] animate-[pulse_1.5s_ease-in-out_infinite]";
 
   const statusText =
-    status === "connected" ? "Connected" : status === "error" ? (error ?? "Error") : "Connecting…";
+    displayStatus === "connected"
+      ? "Connected"
+      : displayStatus === "error"
+        ? (error ?? "Error")
+        : displayStatus === "disconnected"
+          ? "Disconnected"
+          : "Connecting…";
 
   const statusTextColor =
-    status === "connected"
+    displayStatus === "connected"
       ? "text-[var(--color-status-ready)]"
-      : status === "error"
+      : displayStatus === "error" || displayStatus === "disconnected"
         ? "text-[var(--color-status-error)]"
         : "text-[var(--color-text-tertiary)]";
+  const isDarkChrome = appearance === "dark" || resolvedTheme !== "light";
+
+  const fontSizeControls = (
+    <div className="flex items-center">
+      <button
+        onClick={() => setFontSize((prev) => Math.max(FONT_SIZE_MIN, prev - 1))}
+        disabled={fontSize <= FONT_SIZE_MIN}
+        className="w-5 h-5 text-xs flex items-center justify-center rounded hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        aria-label="Decrease font size"
+      >
+        −
+      </button>
+      <span className="w-9 text-center text-xs font-medium text-[var(--color-text-secondary)]">
+        {fontSize}px
+      </span>
+      <button
+        onClick={() => setFontSize((prev) => Math.min(FONT_SIZE_MAX, prev + 1))}
+        disabled={fontSize >= FONT_SIZE_MAX}
+        className="w-5 h-5 text-xs flex items-center justify-center rounded hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        aria-label="Increase font size"
+      >
+        +
+      </button>
+    </div>
+  );
+
+  const fullscreenButton = (
+    <button
+      onClick={() => setFullscreen(!fullscreen)}
+      className={cn(
+        "flex items-center gap-1 px-2 py-0.5 text-[11px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-subtle)] hover:text-[var(--color-text-primary)]",
+        !isOpenCodeSession && !chromeless && "ml-auto",
+      )}
+      aria-label={fullscreen ? "exit fullscreen" : "fullscreen"}
+    >
+      {fullscreen ? (
+        <>
+          <svg
+            className="h-3 w-3"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            viewBox="0 0 24 24"
+          >
+            <path d="M8 3v3a2 2 0 01-2 2H3m18 0h-3a2 2 0 01-2-2V3m0 18v-3a2 2 0 012-2h3M3 16h3a2 2 0 012 2v3" />
+          </svg>
+          exit fullscreen
+        </>
+      ) : (
+        <>
+          <svg
+            className="h-3 w-3"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            viewBox="0 0 24 24"
+          >
+            <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3" />
+          </svg>
+          fullscreen
+        </>
+      )}
+    </button>
+  );
 
   return (
     <div
       className={cn(
-        "overflow-hidden border border-[var(--color-border-default)]",
-        resolvedTheme === "light" ? "bg-[#fafafa]" : "bg-[#0a0a0f]",
-        fullscreen && "fixed inset-0 z-50 rounded-none border-0",
+        "overflow-hidden border border-[var(--color-border-default)] flex flex-col",
+        fullscreen ? "fixed inset-0 z-50 rounded-none border-0" : "relative h-full",
+        isDarkChrome ? "bg-[#0a0a0f]" : "bg-[#fafafa]",
+        chromeless && "border-0",
       )}
     >
-      {/* Terminal chrome bar */}
-      <div className="flex items-center gap-2 border-b border-[var(--color-border-subtle)] bg-[var(--color-bg-elevated)] px-3 py-2">
-        <div className={cn("h-2 w-2 shrink-0 rounded-full", statusDotClass)} />
-        <span className="font-[var(--font-mono)] text-[11px]" style={{ color: accentColor }}>
-          {sessionId}
-        </span>
-        <span
-          className={cn("text-[10px] font-medium uppercase tracking-[0.06em]", statusTextColor)}
-        >
-          {statusText}
-        </span>
-        {/* XDA clipboard badge */}
-        <span
-          className="px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.06em]"
-          style={{
-            color: accentColor,
-            background: `color-mix(in srgb, ${accentColor} 12%, transparent)`,
-          }}
-        >
-          XDA
-        </span>
-        {isOpenCodeSession ? (
+      {!chromeless ? (
+        <div className="terminal-chrome-bar flex items-center gap-2 border-b border-[var(--color-border-subtle)] bg-[var(--color-bg-elevated)] px-3 py-2">
+          {/* Pane label — matches the workspace pane-header style used elsewhere */}
+          <span className="terminal-chrome-pane-label">TERMINAL</span>
+          {/* Identity group: session name on top, status+XDA below on mobile */}
+          <div className="terminal-chrome-identity">
+            <span className="terminal-chrome-session-id font-[var(--font-mono)] text-[11px]" style={{ color: accentColor }}>
+              {sessionId}
+            </span>
+            <div className="terminal-chrome-status-row">
+              <div className={cn("h-2 w-2 shrink-0 rounded-full", statusDotClass)} />
+              <span
+                className={cn("text-[10px] font-medium uppercase tracking-[0.06em]", statusTextColor)}
+              >
+                {statusText}
+              </span>
+              <span
+                className="px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.06em]"
+                style={{
+                  color: accentColor,
+                  background: `color-mix(in srgb, ${accentColor} 12%, transparent)`,
+                }}
+              >
+                XDA
+              </span>
+            </div>
+          </div>
+          <div className="flex-1" />
+          {fontSizeControls}
+          {isOpenCodeSession ? (
+            <button
+              onClick={handleReload}
+              disabled={reloading || muxStatus !== "connected"}
+              title="Restart OpenCode session (/exit then resume mapped session)"
+              aria-label="Restart OpenCode session"
+              className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-subtle)] hover:text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {reloading ? (
+                <>
+                  <svg
+                    className="h-3 w-3 animate-spin"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M12 3a9 9 0 109 9" />
+                  </svg>
+                  restarting
+                </>
+              ) : (
+                <>
+                  <svg
+                    className="h-3 w-3"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M21 12a9 9 0 11-2.64-6.36" />
+                    <path d="M21 3v6h-6" />
+                  </svg>
+                  restart
+                </>
+              )}
+            </button>
+          ) : null}
+          {reloadError ? (
+            <span
+              className="max-w-[40ch] truncate text-[10px] font-medium text-[var(--color-status-error)]"
+              title={reloadError}
+            >
+              {reloadError}
+            </span>
+          ) : null}
+          {fullscreenButton}
+        </div>
+      ) : null}
+      {chromeless ? (
+        <div className="absolute right-3 top-3 z-10 flex items-center gap-1 rounded-[6px] border border-[var(--color-border-subtle)] bg-[color-mix(in_srgb,var(--color-bg-elevated)_92%,transparent)] px-1.5 py-1 shadow-[0_8px_24px_rgba(0,0,0,0.18)] backdrop-blur-sm">
+          {isOpenCodeSession ? (
+            <button
+              onClick={handleReload}
+              disabled={reloading || muxStatus !== "connected"}
+              title="Restart OpenCode session (/exit then resume mapped session)"
+              aria-label="Restart OpenCode session"
+              className="flex items-center gap-1 px-2 py-0.5 text-[11px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-subtle)] hover:text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {reloading ? (
+                <>
+                  <svg
+                    className="h-3 w-3 animate-spin"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M12 3a9 9 0 109 9" />
+                  </svg>
+                  restarting
+                </>
+              ) : (
+                <>
+                  <svg
+                    className="h-3 w-3"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M21 12a9 9 0 11-2.64-6.36" />
+                    <path d="M21 3v6h-6" />
+                  </svg>
+                  restart
+                </>
+              )}
+            </button>
+          ) : null}
+          {fullscreenButton}
+        </div>
+      ) : null}
+      {/* Terminal area — flex:1 so it fills remaining space after the chrome bar */}
+      <div className="relative flex-1 min-h-0 flex flex-col">
+        {!followOutput ? (
           <button
-            onClick={handleReload}
-            disabled={reloading || status !== "connected"}
-            title="Restart OpenCode session (/exit then resume mapped session)"
-            aria-label="Restart OpenCode session"
-            className="ml-auto flex items-center gap-1 px-2 py-0.5 text-[11px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-subtle)] hover:text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-70"
+            type="button"
+            onClick={() => {
+              followOutputRef.current = true;
+              setFollowOutput(true);
+              const t = terminalInstance.current;
+              if (t) {
+                const vp = t.element?.querySelector<HTMLElement>(".xterm-viewport");
+                if (vp) vp.scrollTop = vp.scrollHeight;
+              }
+            }}
+            className="absolute bottom-3 right-3 z-20 flex h-8 w-8 items-center justify-center rounded-full border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] text-[var(--color-text-primary)] shadow-md active:scale-95"
+            aria-label="Jump to latest"
+            title="Jump to latest"
           >
-            {reloading ? (
-              <>
-                <svg
-                  className="h-3 w-3 animate-spin"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  viewBox="0 0 24 24"
-                >
-                  <path d="M12 3a9 9 0 109 9" />
-                </svg>
-                restarting
-              </>
-            ) : (
-              <>
-                <svg
-                  className="h-3 w-3"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  viewBox="0 0 24 24"
-                >
-                  <path d="M21 12a9 9 0 11-2.64-6.36" />
-                  <path d="M21 3v6h-6" />
-                </svg>
-                restart
-              </>
-            )}
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+            </svg>
           </button>
         ) : null}
-        {reloadError ? (
-          <span
-            className="max-w-[40ch] truncate text-[10px] font-medium text-[var(--color-status-error)]"
-            title={reloadError}
-          >
-            {reloadError}
-          </span>
-        ) : null}
-        <button
-          onClick={() => setFullscreen(!fullscreen)}
-          className={cn(
-            "flex items-center gap-1 px-2 py-0.5 text-[11px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-subtle)] hover:text-[var(--color-text-primary)]",
-            !isOpenCodeSession && "ml-auto",
-          )}
-        >
-          {fullscreen ? (
-            <>
-              <svg
-                className="h-3 w-3"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                viewBox="0 0 24 24"
-              >
-                <path d="M8 3v3a2 2 0 01-2 2H3m18 0h-3a2 2 0 01-2-2V3m0 18v-3a2 2 0 012-2h3M3 16h3a2 2 0 012 2v3" />
-              </svg>
-              exit fullscreen
-            </>
-          ) : (
-            <>
-              <svg
-                className="h-3 w-3"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                viewBox="0 0 24 24"
-              >
-                <path d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3" />
-              </svg>
-              fullscreen
-            </>
-          )}
-        </button>
+        <div
+          ref={terminalRef}
+          className="w-full flex flex-col flex-1 min-h-0 overflow-hidden"
+        />
       </div>
-      {/* Terminal area */}
-      <div
-        ref={terminalRef}
-        className={cn("w-full p-1.5")}
-        style={{
-          overflow: "hidden",
-          display: "flex",
-          flexDirection: "column",
-          height: fullscreen ? "calc(100dvh - 37px)" : height,
-        }}
-      />
     </div>
   );
 }

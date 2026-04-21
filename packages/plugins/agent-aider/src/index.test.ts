@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { Session, RuntimeHandle, AgentLaunchConfig } from "@composio/ao-core";
+import { createActivitySignal, type Session, type RuntimeHandle, type AgentLaunchConfig } from "@aoagents/ao-core";
 
 // Mock fs/promises for getSessionInfo tests (readFile for .aider.chat.history.md)
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -18,7 +18,7 @@ const { mockAppendActivityEntry, mockReadLastActivityEntry, mockRecordTerminalAc
     mockRecordTerminalActivity: vi.fn().mockResolvedValue(undefined),
   }));
 
-vi.mock("@composio/ao-core", async (importOriginal) => {
+vi.mock("@aoagents/ao-core", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
   return {
     ...actual,
@@ -53,6 +53,11 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     projectId: "test-project",
     status: "working",
     activity: "active",
+    activitySignal: createActivitySignal("valid", {
+      activity: "active",
+      timestamp: new Date(),
+      source: "native",
+    }),
     branch: "feat/test",
     issueId: null,
     pr: null,

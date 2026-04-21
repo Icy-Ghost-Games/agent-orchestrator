@@ -7,10 +7,12 @@ const {
   mockRegistry,
   tmuxPlugin,
   claudePlugin,
+  codexPlugin,
   opencodePlugin,
   worktreePlugin,
   scmPlugin,
   trackerGithubPlugin,
+  trackerJiraPlugin,
   trackerLinearPlugin,
 } = vi.hoisted(() => {
   const mockLoadConfig = vi.fn();
@@ -31,15 +33,17 @@ const {
     mockRegistry,
     tmuxPlugin: { manifest: { name: "tmux" } },
     claudePlugin: { manifest: { name: "claude-code" } },
+    codexPlugin: { manifest: { name: "codex" } },
     opencodePlugin: { manifest: { name: "opencode" } },
     worktreePlugin: { manifest: { name: "worktree" } },
     scmPlugin: { manifest: { name: "github" } },
     trackerGithubPlugin: { manifest: { name: "github" } },
+    trackerJiraPlugin: { manifest: { name: "jira" } },
     trackerLinearPlugin: { manifest: { name: "linear" } },
   };
 });
 
-vi.mock("@composio/ao-core", () => ({
+vi.mock("@aoagents/ao-core", () => ({
   loadConfig: mockLoadConfig,
   createPluginRegistry: () => mockRegistry,
   createSessionManager: mockCreateSessionManager,
@@ -49,21 +53,19 @@ vi.mock("@composio/ao-core", () => ({
     getStates: vi.fn(),
     check: vi.fn(),
   }),
-  decompose: vi.fn(),
-  getLeaves: vi.fn(),
-  getSiblings: vi.fn(),
-  formatPlanTree: vi.fn(),
-  DEFAULT_DECOMPOSER_CONFIG: {},
   TERMINAL_STATUSES: new Set(["merged", "killed"]) as ReadonlySet<string>,
 }));
 
-vi.mock("@composio/ao-plugin-runtime-tmux", () => ({ default: tmuxPlugin }));
-vi.mock("@composio/ao-plugin-agent-claude-code", () => ({ default: claudePlugin }));
-vi.mock("@composio/ao-plugin-agent-opencode", () => ({ default: opencodePlugin }));
-vi.mock("@composio/ao-plugin-workspace-worktree", () => ({ default: worktreePlugin }));
-vi.mock("@composio/ao-plugin-scm-github", () => ({ default: scmPlugin }));
-vi.mock("@composio/ao-plugin-tracker-github", () => ({ default: trackerGithubPlugin }));
-vi.mock("@composio/ao-plugin-tracker-linear", () => ({ default: trackerLinearPlugin }));
+vi.mock("@aoagents/ao-plugin-runtime-tmux", () => ({ default: tmuxPlugin }));
+vi.mock("@aoagents/ao-plugin-agent-claude-code", () => ({ default: claudePlugin }));
+vi.mock("@aoagents/ao-plugin-agent-codex", () => ({ default: codexPlugin }));
+vi.mock("@aoagents/ao-plugin-agent-cursor", () => ({ default: { manifest: { name: "cursor" } } }));
+vi.mock("@aoagents/ao-plugin-agent-opencode", () => ({ default: opencodePlugin }));
+vi.mock("@aoagents/ao-plugin-workspace-worktree", () => ({ default: worktreePlugin }));
+vi.mock("@aoagents/ao-plugin-scm-github", () => ({ default: scmPlugin }));
+vi.mock("@aoagents/ao-plugin-tracker-github", () => ({ default: trackerGithubPlugin }));
+vi.mock("@aoagents/ao-plugin-tracker-jira", () => ({ default: trackerJiraPlugin }));
+vi.mock("@aoagents/ao-plugin-tracker-linear", () => ({ default: trackerLinearPlugin }));
 
 describe("services", () => {
   beforeEach(() => {
@@ -97,6 +99,22 @@ describe("services", () => {
     await getServices();
 
     expect(mockRegister).toHaveBeenCalledWith(opencodePlugin);
+  });
+
+  it("registers the Codex agent plugin with web services", async () => {
+    const { getServices } = await import("../lib/services");
+
+    await getServices();
+
+    expect(mockRegister).toHaveBeenCalledWith(codexPlugin);
+  });
+
+  it("registers the Jira tracker plugin with web services", async () => {
+    const { getServices } = await import("../lib/services");
+
+    await getServices();
+
+    expect(mockRegister).toHaveBeenCalledWith(trackerJiraPlugin);
   });
 
   it("caches initialized services across repeated calls", async () => {

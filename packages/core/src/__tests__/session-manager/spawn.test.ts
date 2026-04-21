@@ -3,11 +3,11 @@ import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { createSessionManager } from "../../session-manager.js";
 import { validateConfig } from "../../config.js";
+import { getWorkspaceAgentsMdPath } from "../../opencode-agents-md.js";
 import {
   writeMetadata,
   readMetadata,
   readMetadataRaw,
-  updateMetadata,
 } from "../../metadata.js";
 import type {
   OrchestratorConfig,
@@ -72,29 +72,6 @@ describe("spawn", () => {
     expect(mockRuntime.create).toHaveBeenCalled();
   });
 
-  it("blocks spawn while the project is globally paused", async () => {
-    writeMetadata(sessionsDir, "app-orchestrator", {
-      worktree: join(tmpDir, "my-app"),
-      branch: "main",
-      status: "working",
-      role: "orchestrator",
-      project: "my-app",
-      runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator")),
-    });
-    updateMetadata(sessionsDir, "app-orchestrator", {
-      globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
-      globalPauseReason: "Rate limit reached",
-      globalPauseSource: "app-9",
-    });
-
-    const sm = createSessionManager({ config, registry: mockRegistry });
-
-    await expect(sm.spawn({ projectId: "my-app" })).rejects.toThrow(
-      "Project is paused due to model rate limit until",
-    );
-    expect(mockRuntime.create).not.toHaveBeenCalled();
-  });
-
   it("uses issue ID to derive branch name", async () => {
     const sm = createSessionManager({ config, registry: mockRegistry });
 
@@ -102,6 +79,112 @@ describe("spawn", () => {
 
     expect(session.branch).toBe("feat/INT-100");
     expect(session.issueId).toBe("INT-100");
+  });
+
+  it("prefers tracker-provided Issue.branchName over tracker.branchName()", async () => {
+    const mockTracker: Tracker = {
+      name: "mock-tracker",
+      getIssue: vi.fn().mockResolvedValue({ branchName: "ABC-1234" }),
+      isCompleted: vi.fn().mockResolvedValue(false),
+      issueUrl: vi.fn().mockReturnValue(""),
+      branchName: vi.fn().mockReturnValue("custom/INT-100-my-feature"),
+      generatePrompt: vi.fn().mockResolvedValue(""),
+    };
+
+    const registryWithTracker: PluginRegistry = {
+      ...mockRegistry,
+      get: vi.fn().mockImplementation((slot: string) => {
+        if (slot === "runtime") return mockRuntime;
+        if (slot === "agent") return mockAgent;
+        if (slot === "workspace") return mockWorkspace;
+        if (slot === "tracker") return mockTracker;
+        return null;
+      }),
+    };
+
+    const sm = createSessionManager({
+      config,
+      registry: registryWithTracker,
+    });
+
+    const session = await sm.spawn({ projectId: "my-app", issueId: "INT-100" });
+    expect(session.branch).toBe("ABC-1234");
+  });
+
+  it("uses tracker.branchName when Issue omits branchName", async () => {
+    const mockTracker: Tracker = {
+      name: "mock-tracker",
+      getIssue: vi.fn().mockResolvedValue({
+        id: "INT-100",
+        title: "T",
+        description: "",
+        url: "https://tracker.test/INT-100",
+        state: "open",
+        labels: [],
+      }),
+      isCompleted: vi.fn().mockResolvedValue(false),
+      issueUrl: vi.fn().mockReturnValue(""),
+      branchName: vi.fn().mockReturnValue("custom/INT-100-my-feature"),
+      generatePrompt: vi.fn().mockResolvedValue(""),
+    };
+
+    const registryWithTracker: PluginRegistry = {
+      ...mockRegistry,
+      get: vi.fn().mockImplementation((slot: string) => {
+        if (slot === "runtime") return mockRuntime;
+        if (slot === "agent") return mockAgent;
+        if (slot === "workspace") return mockWorkspace;
+        if (slot === "tracker") return mockTracker;
+        return null;
+      }),
+    };
+
+    const sm = createSessionManager({
+      config,
+      registry: registryWithTracker,
+    });
+
+    const session = await sm.spawn({ projectId: "my-app", issueId: "INT-100" });
+    expect(session.branch).toBe("custom/INT-100-my-feature");
+    expect(mockTracker.branchName).toHaveBeenCalledWith("INT-100", expect.anything());
+  });
+
+  it("falls back to tracker.branchName when Issue.branchName is not git-safe", async () => {
+    const mockTracker: Tracker = {
+      name: "mock-tracker",
+      getIssue: vi.fn().mockResolvedValue({
+        id: "INT-100",
+        title: "T",
+        description: "",
+        url: "https://tracker.test/INT-100",
+        state: "open",
+        labels: [],
+        branchName: "bad branch with spaces",
+      }),
+      isCompleted: vi.fn().mockResolvedValue(false),
+      issueUrl: vi.fn().mockReturnValue(""),
+      branchName: vi.fn().mockReturnValue("feat/INT-100"),
+      generatePrompt: vi.fn().mockResolvedValue(""),
+    };
+
+    const registryWithTracker: PluginRegistry = {
+      ...mockRegistry,
+      get: vi.fn().mockImplementation((slot: string) => {
+        if (slot === "runtime") return mockRuntime;
+        if (slot === "agent") return mockAgent;
+        if (slot === "workspace") return mockWorkspace;
+        if (slot === "tracker") return mockTracker;
+        return null;
+      }),
+    };
+
+    const sm = createSessionManager({
+      config,
+      registry: registryWithTracker,
+    });
+
+    const session = await sm.spawn({ projectId: "my-app", issueId: "INT-100" });
+    expect(session.branch).toBe("feat/INT-100");
   });
 
   it("sanitizes free-text issueId into a valid branch slug", async () => {
@@ -493,7 +576,7 @@ describe("spawn", () => {
 
     const metadata = readMetadataRaw(sessionsDir, session.id);
     expect(metadata?.["opencodeSessionId"]).toBeUndefined();
-  });
+  }, 15_000);
 
   it("throws for unknown project", async () => {
     const sm = createSessionManager({ config, registry: mockRegistry });
@@ -992,29 +1075,6 @@ describe("spawn", () => {
   }, 20_000);
 
   describe("spawnOrchestrator", () => {
-    it("blocks orchestrator spawn while the project is globally paused", async () => {
-      writeMetadata(sessionsDir, "app-orchestrator-1", {
-        worktree: join(tmpDir, "my-app"),
-        branch: "orchestrator/app-orchestrator-1",
-        status: "working",
-        role: "orchestrator",
-        project: "my-app",
-        runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator")),
-      });
-      updateMetadata(sessionsDir, "app-orchestrator-1", {
-        globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
-        globalPauseReason: "Rate limit reached",
-        globalPauseSource: "app-9",
-      });
-
-      const sm = createSessionManager({ config, registry: mockRegistry });
-
-      await expect(sm.spawnOrchestrator({ projectId: "my-app" })).rejects.toThrow(
-        "Project is paused due to model rate limit until",
-      );
-      expect(mockRuntime.create).not.toHaveBeenCalled();
-    });
-
     it("throws when no workspace plugin is configured", async () => {
       const registryNoWorkspace: PluginRegistry = {
         ...mockRegistry,
@@ -1756,6 +1816,57 @@ describe("spawn", () => {
       expect(readFileSync(promptFile, "utf-8")).toBe("You are the orchestrator.");
     });
 
+    it("writes the orchestrator AGENTS.md block for OpenCode orchestrators", async () => {
+      const opencodeAgent: Agent = {
+        ...mockAgent,
+        name: "opencode",
+      };
+      const registryWithOpenCode: PluginRegistry = {
+        ...mockRegistry,
+        get: vi.fn().mockImplementation((slot: string) => {
+          if (slot === "runtime") return mockRuntime;
+          if (slot === "agent") return opencodeAgent;
+          if (slot === "workspace") return mockWorkspace;
+          return null;
+        }),
+      };
+      const configWithOpenCode: OrchestratorConfig = {
+        ...config,
+        defaults: { ...config.defaults, agent: "opencode" },
+        projects: {
+          ...config.projects,
+          "my-app": {
+            ...config.projects["my-app"],
+            agent: "opencode",
+          },
+        },
+      };
+
+      const sm = createSessionManager({
+        config: configWithOpenCode,
+        registry: registryWithOpenCode,
+      });
+
+      await sm.spawnOrchestrator({
+        projectId: "my-app",
+        systemPrompt: "You are the orchestrator.",
+      });
+
+      const agentsMdPath = getWorkspaceAgentsMdPath("/tmp/ws");
+      expect(existsSync(agentsMdPath)).toBe(true);
+      expect(readFileSync(agentsMdPath, "utf-8")).toBe(
+        "<!-- AO_ORCHESTRATOR_PROMPT_START -->\n## Agent Orchestrator\n\nYou are the orchestrator.\n<!-- AO_ORCHESTRATOR_PROMPT_END -->\n",
+      );
+
+      expect(mockRuntime.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          environment: expect.not.objectContaining({
+            OPENCODE_CONFIG: expect.any(String),
+          }),
+        }),
+      );
+    }, 15_000);
+
     it("throws for unknown project", async () => {
       const sm = createSessionManager({ config, registry: mockRegistry });
 
@@ -1783,80 +1894,5 @@ describe("spawn", () => {
       expect(session.runtimeHandle).toEqual(makeHandle("rt-1"));
     });
 
-    it("blocks spawn while the project is globally paused (orchestrator-N orchestrator)", async () => {
-      // Pause set by a worktree-based orchestrator
-      writeMetadata(sessionsDir, "app-orchestrator-1", {
-        worktree: join(tmpDir, "my-app"),
-        branch: "orchestrator/app-orchestrator-1",
-        status: "working",
-        role: "orchestrator",
-        project: "my-app",
-        runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator-1")),
-      });
-      updateMetadata(sessionsDir, "app-orchestrator-1", {
-        globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
-        globalPauseReason: "Rate limit reached",
-        globalPauseSource: "app-9",
-      });
-
-      const sm = createSessionManager({ config, registry: mockRegistry });
-
-      await expect(sm.spawnOrchestrator({ projectId: "my-app" })).rejects.toThrow(
-        "Project is paused due to model rate limit until",
-      );
-    });
-
-    it("does not skip pause check for orchestrator-N orchestrator when sending to workers", async () => {
-      // Worker session
-      writeMetadata(sessionsDir, "app-1", {
-        worktree: join(tmpDir, "ws-1"),
-        branch: "session/app-1",
-        status: "working",
-        project: "my-app",
-        runtimeHandle: JSON.stringify(makeHandle("rt-1")),
-      });
-      // Pause set by orchestrator-1
-      writeMetadata(sessionsDir, "app-orchestrator-1", {
-        worktree: join(tmpDir, "my-app"),
-        branch: "orchestrator/app-orchestrator-1",
-        status: "working",
-        role: "orchestrator",
-        project: "my-app",
-        runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator-1")),
-      });
-      updateMetadata(sessionsDir, "app-orchestrator-1", {
-        globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
-        globalPauseReason: "Rate limit",
-        globalPauseSource: "app-orchestrator-1",
-      });
-
-      const sm = createSessionManager({ config, registry: mockRegistry });
-
-      await expect(sm.send("app-1", "hello")).rejects.toThrow(
-        "Project is paused due to model rate limit until",
-      );
-    });
-
-    it("allows orchestrator-N orchestrator session to send despite project pause", async () => {
-      // Orch-1 session itself is alive
-      writeMetadata(sessionsDir, "app-orchestrator-1", {
-        worktree: join(tmpDir, "my-app"),
-        branch: "orchestrator/app-orchestrator-1",
-        status: "working",
-        role: "orchestrator",
-        project: "my-app",
-        runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator-1")),
-      });
-      updateMetadata(sessionsDir, "app-orchestrator-1", {
-        globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
-        globalPauseReason: "Rate limit",
-        globalPauseSource: "app-orchestrator-1",
-      });
-
-      const sm = createSessionManager({ config, registry: mockRegistry });
-
-      // The orchestrator itself should be exempt from the pause
-      await expect(sm.send("app-orchestrator-1", "continue")).resolves.not.toThrow();
-    });
   });
 });

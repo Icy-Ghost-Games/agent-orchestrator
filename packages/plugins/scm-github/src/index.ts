@@ -28,7 +28,7 @@ import {
   type MergeReadiness,
   type PREnrichmentData,
   type BatchObserver,
-} from "@composio/ao-core";
+} from "@aoagents/ao-core";
 import {
   enrichSessionsPRBatch as enrichSessionsPRBatchImpl,
 } from "./graphql-batch.js";
@@ -37,7 +37,7 @@ import {
   parseWebhookBranchRef,
   parseWebhookJsonObject,
   parseWebhookTimestamp,
-} from "@composio/ao-core/scm-webhook-utils";
+} from "@aoagents/ao-core/scm-webhook-utils";
 
 const execFileAsync = promisify(execFile);
 
@@ -515,7 +515,7 @@ function createGitHubSCM(): SCM {
     },
 
     async detectPR(session: Session, project: ProjectConfig): Promise<PRInfo | null> {
-      if (!session.branch) return null;
+      if (!session.branch || !project.repo) return null;
       parseProjectRepo(project.repo);
       try {
         const raw = await gh([
@@ -549,6 +549,9 @@ function createGitHubSCM(): SCM {
     },
 
     async resolvePR(reference: string, project: ProjectConfig): Promise<PRInfo> {
+      if (!project.repo) {
+        throw new Error("Cannot resolve PR: project has no repo configured");
+      }
       const raw = await gh([
         "pr",
         "view",

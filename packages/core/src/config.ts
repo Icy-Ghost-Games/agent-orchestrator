@@ -77,7 +77,7 @@ export function loadEnvFile(envPath: string): void {
 }
 
 function inferScmPlugin(project: {
-  repo: string;
+  repo?: string;
   scm?: Record<string, unknown>;
   tracker?: Record<string, unknown>;
 }): "github" | "gitlab" {
@@ -221,23 +221,9 @@ const RoleAgentConfigSchema = z
   })
   .optional();
 
-const DecomposerConfigSchema = z
-  .object({
-    enabled: z.boolean().default(false),
-    maxDepth: z.number().min(1).max(5).default(3),
-    model: z.string().default("claude-sonnet-4-20250514"),
-    requireApproval: z.boolean().default(true),
-  })
-  .default({
-    enabled: false,
-    maxDepth: 3,
-    model: "claude-sonnet-4-20250514",
-    requireApproval: true,
-  });
-
 const ProjectConfigSchema = z.object({
   name: z.string().optional(),
-  repo: z.string(),
+  repo: z.string().optional(),
   path: z.string(),
   defaultBranch: z.string().default("main"),
   sessionPrefix: z
@@ -262,14 +248,13 @@ const ProjectConfigSchema = z.object({
     .enum(["reuse", "delete", "ignore", "delete-new", "ignore-new", "kill-previous"])
     .optional(),
   opencodeIssueSessionStrategy: z.enum(["reuse", "delete", "ignore"]).optional(),
-  decomposer: DecomposerConfigSchema.optional(),
 });
 
 const DefaultPluginsSchema = z.object({
   runtime: z.string().default("tmux"),
   agent: z.string().default("claude-code"),
   workspace: z.string().default("worktree"),
-  notifiers: z.array(z.string()).default(["composio", "desktop"]),
+  notifiers: z.array(z.string()).default([]),
   orchestrator: RoleAgentDefaultsSchema,
   worker: RoleAgentDefaultsSchema,
 });
@@ -301,21 +286,63 @@ const InstalledPluginConfigSchema = z
     }
   });
 
+const PowerConfigSchema = z
+  .object({
+    /**
+     * Prevent macOS idle sleep while AO is running.
+     * Uses `caffeinate -i -w <pid>` to hold an assertion.
+     * Defaults to true on macOS, no-op on other platforms.
+     */
+    preventIdleSleep: z.boolean().default(process.platform === "darwin"),
+  })
+  .default({});
+
+const DashboardConfigSchema = z.object({
+  attentionZones: z.enum(["simple", "detailed"]).default("simple"),
+});
+
+const LifecycleConfigSchema = z
+  .object({
+    /**
+     * When a session's PR is detected as merged, automatically tear down the
+     * tmux runtime, remove the worktree, and archive the session metadata.
+     * Defaults to true so `ao status` does not retain stale merged entries.
+     */
+    autoCleanupOnMerge: z.boolean().default(true),
+    /**
+     * Maximum time (ms) to wait after a session enters `merged` before forcing
+     * cleanup regardless of agent activity. Defaults to 5 minutes. Use `0` to
+     * disable the grace window (cleanup runs immediately even if the agent is
+     * still active). Values between 1 and 9999 are rejected to catch the common
+     * mistake of writing seconds (e.g. `5`) when milliseconds are expected.
+     */
+    mergeCleanupIdleGraceMs: z
+      .number()
+      .nonnegative()
+      .refine((v) => v === 0 || v >= 10_000, {
+        message:
+          "mergeCleanupIdleGraceMs is in milliseconds; values between 1 and 9999 are likely a units mistake (use 0 to disable the gate, or e.g. 10000 for 10s, 300000 for 5min)",
+      })
+      .default(300_000),
+  })
+  .default({});
+
 const OrchestratorConfigSchema = z.object({
   port: z.number().default(3000),
   terminalPort: z.number().optional(),
   directTerminalPort: z.number().optional(),
   readyThresholdMs: z.number().nonnegative().default(300_000),
+  power: PowerConfigSchema,
+  lifecycle: LifecycleConfigSchema,
   defaults: DefaultPluginsSchema.default({}),
   plugins: z.array(InstalledPluginConfigSchema).default([]),
-  projects: z.record(ProjectConfigSchema),
+  dashboard: DashboardConfigSchema.optional(),
+  projects: z.record(
+    z.string().regex(/^[a-zA-Z0-9_-]+$/, "Project ID must match [a-zA-Z0-9_-]+ (no dots, slashes, or special characters)"),
+    ProjectConfigSchema,
+  ),
   notifiers: z.record(NotifierConfigSchema).default({}),
-  notificationRouting: z.record(z.array(z.string())).default({
-    urgent: ["desktop", "composio"],
-    action: ["desktop", "composio"],
-    warning: ["composio"],
-    info: ["composio"],
-  }),
+  notificationRouting: z.record(z.array(z.string())).default({}),
   reactions: z.record(ReactionConfigSchema).default({}),
 });
 
@@ -538,12 +565,12 @@ function applyProjectDefaults(config: OrchestratorConfig): OrchestratorConfig {
     const inferredPlugin = inferScmPlugin(project);
 
     // Infer SCM from repo if not set
-    if (!project.scm && project.repo.includes("/")) {
+    if (!project.scm && project.repo?.includes("/")) {
       project.scm = { plugin: inferredPlugin };
     }
 
     // Infer tracker from repo if not set (default to github issues)
-    if (!project.tracker) {
+    if (!project.tracker && project.repo?.includes("/")) {
       project.tracker = { plugin: inferredPlugin };
     }
   }
@@ -611,6 +638,13 @@ function validateProjectUniqueness(config: OrchestratorConfig): void {
 /** Apply default reactions */
 function applyDefaultReactions(config: OrchestratorConfig): OrchestratorConfig {
   const defaults: Record<string, (typeof config.reactions)[string]> = {
+    "pr-closed": {
+      auto: true,
+      action: "notify",
+      priority: "action",
+      message:
+        "A PR was closed without merging. Decide whether to learn from the closure, resume the work, or terminate the session.",
+    },
     "ci-failed": {
       auto: true,
       action: "send-to-agent",

@@ -37,8 +37,8 @@ import { createSessionManager } from "../session-manager.js";
 import { createLifecycleManager } from "../lifecycle-manager.js";
 import { writeMetadata } from "../metadata.js";
 import { getSessionsDir, getProjectBaseDir } from "../paths.js";
-import trackerGithub from "@composio/ao-plugin-tracker-github";
-import scmGithub from "@composio/ao-plugin-scm-github";
+import trackerGithub from "@aoagents/ao-plugin-tracker-github";
+import scmGithub from "@aoagents/ao-plugin-scm-github";
 import { createMockPlugins, makeHandle, makeSession as makeSessionBase, makePR, type TestEnvironment } from "./test-utils.js";
 import type {
   OrchestratorConfig,
@@ -392,7 +392,7 @@ describe("plugin integration", () => {
 
   // -------------------------------------------------------------------------
   describe("SessionManager + SCM", () => {
-    it("cleanup() calls scm-github getPRState() and kills merged PR sessions", async () => {
+    it("cleanup() calls scm-github getPRState() but keeps merged PR sessions alive", async () => {
       const registry = createTestRegistry();
       const sm = createSessionManager({ config, registry });
 
@@ -412,7 +412,7 @@ describe("plugin integration", () => {
 
       const result = await sm.cleanup("my-app");
 
-      expect(result.killed).toContain("app-1");
+      expect(result.skipped).toContain("app-1");
       // Verify gh CLI was called for PR state check
       expect(ghMock).toHaveBeenCalledWith(
         "gh",

@@ -3,16 +3,17 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import type {
-  Session,
-  PRInfo,
-  SCM,
-  Agent,
-  Tracker,
-  ProjectConfig,
-  OrchestratorConfig,
-  PluginRegistry,
-} from "@composio/ao-core";
+import {
+  createInitialCanonicalLifecycle,
+  type Session,
+  type PRInfo,
+  type SCM,
+  type Agent,
+  type Tracker,
+  type ProjectConfig,
+  type OrchestratorConfig,
+  type PluginRegistry,
+} from "@aoagents/ao-core";
 import {
   sessionToDashboard,
   resolveProject,
@@ -21,18 +22,33 @@ import {
   enrichSessionIssue,
   enrichSessionIssueTitle,
   enrichSessionsMetadata,
+  enrichSessionsMetadataFast,
   computeStats,
+  listDashboardOrchestrators,
 } from "../serialize";
 import { prCache, prCacheKey } from "../cache";
 import type { DashboardSession } from "../types";
 
 // Helper to create a minimal Session for testing
 function createCoreSession(overrides?: Partial<Session>): Session {
+  const lifecycle = createInitialCanonicalLifecycle("worker", new Date("2025-01-01T00:00:00Z"));
+  lifecycle.session.state = "working";
+  lifecycle.session.reason = "task_in_progress";
+  lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+  lifecycle.runtime.state = "alive";
+  lifecycle.runtime.reason = "process_running";
   return {
     id: "test-1",
     projectId: "test",
     status: "working",
     activity: "active",
+    activitySignal: {
+      state: "valid",
+      activity: "active",
+      timestamp: new Date("2025-01-01T01:00:00Z"),
+      source: "native",
+    },
+    lifecycle,
     branch: "feat/test",
     issueId: null,
     pr: null,
@@ -122,9 +138,76 @@ describe("sessionToDashboard", () => {
     expect(dashboard.projectId).toBe("test");
     expect(dashboard.status).toBe("working");
     expect(dashboard.activity).toBe("active");
+    expect(dashboard.activitySignal).toEqual({
+      state: "valid",
+      activity: "active",
+      timestamp: "2025-01-01T01:00:00.000Z",
+      source: "native",
+      detail: undefined,
+    });
     expect(dashboard.branch).toBe("feat/test");
     expect(dashboard.createdAt).toBe("2025-01-01T00:00:00.000Z");
     expect(dashboard.lastActivityAt).toBe("2025-01-01T01:00:00.000Z");
+  });
+
+  it("should expose canonical lifecycle fields", () => {
+    const coreSession = createCoreSession();
+    const dashboard = sessionToDashboard(coreSession);
+
+    expect(dashboard.lifecycle?.sessionState).toBe("working");
+    expect(dashboard.lifecycle?.sessionReason).toBe("task_in_progress");
+    expect(dashboard.lifecycle?.prState).toBe("none");
+    expect(dashboard.lifecycle?.prReason).toBe("not_created");
+    expect(dashboard.lifecycle?.runtimeState).toBe("alive");
+    expect(dashboard.lifecycle?.runtimeReason).toBe("process_running");
+    expect(dashboard.lifecycle?.session.label).toBe("working");
+    expect(dashboard.lifecycle?.pr.label).toBe("not created");
+    expect(dashboard.lifecycle?.runtime.label).toBe("alive");
+    expect(dashboard.lifecycle?.summary).toContain("Session working");
+    expect(dashboard.attentionLevel).toBe("working");
+  });
+
+  it("should expose detecting guidance and evidence from legacy metadata", () => {
+    const lifecycle = createInitialCanonicalLifecycle("worker", new Date("2025-01-01T00:00:00Z"));
+    lifecycle.session.state = "detecting";
+    lifecycle.session.reason = "probe_failure";
+    lifecycle.runtime.state = "probe_failed";
+    lifecycle.runtime.reason = "probe_error";
+    const coreSession = createCoreSession({
+      lifecycle,
+      status: "detecting",
+      metadata: {
+        lifecycleEvidence: "signal_disagreement runtime_alive process_unknown",
+        detectingAttempts: "2",
+      },
+    });
+
+    const dashboard = sessionToDashboard(coreSession);
+
+    expect(dashboard.lifecycle?.guidance).toContain("Retry 2");
+    expect(dashboard.lifecycle?.evidence).toContain("signal_disagreement");
+    expect(dashboard.attentionLevel).toBe("respond");
+  });
+
+  it("should seed dashboard PR state from canonical lifecycle truth", () => {
+    const lifecycle = createInitialCanonicalLifecycle("worker", new Date("2025-01-01T00:00:00Z"));
+    lifecycle.session.state = "idle";
+    lifecycle.session.reason = "merged_waiting_decision";
+    lifecycle.session.startedAt = lifecycle.session.lastTransitionAt;
+    lifecycle.pr.state = "merged";
+    lifecycle.pr.reason = "merged";
+    lifecycle.runtime.state = "alive";
+    lifecycle.runtime.reason = "process_running";
+
+    const coreSession = createCoreSession({
+      status: "idle",
+      lifecycle,
+      pr: createPRInfo(),
+    });
+
+    const dashboard = sessionToDashboard(coreSession);
+
+    expect(dashboard.pr?.state).toBe("merged");
   });
 
   it("should use agentInfo summary with summaryIsFallback false", () => {
@@ -191,6 +274,51 @@ describe("sessionToDashboard", () => {
     expect(dashboard.summaryIsFallback).toBe(false);
   });
 
+  it("should use live agentInfo summary even when pinnedSummary is set in metadata", () => {
+    const coreSession = createCoreSession({
+      agentInfo: {
+        summary: "Latest live summary from agent",
+        summaryIsFallback: false,
+        agentSessionId: "abc123",
+      },
+      metadata: { pinnedSummary: "First pinned summary" },
+    });
+    const dashboard = sessionToDashboard(coreSession);
+
+    // pinnedSummary must NOT replace dashboard.summary — live summary wins
+    expect(dashboard.summary).toBe("Latest live summary from agent");
+    expect(dashboard.summaryIsFallback).toBe(false);
+    // pinnedSummary remains accessible via metadata for title selection
+    expect(dashboard.metadata["pinnedSummary"]).toBe("First pinned summary");
+  });
+
+  it("should use metadata summary when pinnedSummary is also set (pinnedSummary only for titles)", () => {
+    const coreSession = createCoreSession({
+      agentInfo: null,
+      metadata: { pinnedSummary: "Pinned summary", summary: "Metadata summary" },
+    });
+    const dashboard = sessionToDashboard(coreSession);
+
+    // pinnedSummary must NOT override the regular metadata summary
+    expect(dashboard.summary).toBe("Metadata summary");
+    expect(dashboard.summaryIsFallback).toBe(false);
+  });
+
+  it("should use agentInfo summary regardless of pinnedSummary value", () => {
+    const coreSession = createCoreSession({
+      agentInfo: {
+        summary: "Agent summary",
+        summaryIsFallback: false,
+        agentSessionId: "abc123",
+      },
+      metadata: { pinnedSummary: "" },
+    });
+    const dashboard = sessionToDashboard(coreSession);
+
+    expect(dashboard.summary).toBe("Agent summary");
+    expect(dashboard.summaryIsFallback).toBe(false);
+  });
+
   it("should convert PRInfo to DashboardPR with defaults", () => {
     const pr = createPRInfo();
     const coreSession = createCoreSession({ pr });
@@ -205,7 +333,8 @@ describe("sessionToDashboard", () => {
     expect(dashboard.pr?.deletions).toBe(0);
     expect(dashboard.pr?.ciStatus).toBe("none");
     expect(dashboard.pr?.reviewDecision).toBe("none");
-    expect(dashboard.pr?.mergeability.blockers).toContain("Data not loaded");
+    expect(dashboard.pr?.mergeability.blockers).toEqual([]);
+    expect(dashboard.pr?.enriched).toBe(false);
   });
 
   it("should set pr to null when session has no PR", () => {
@@ -396,6 +525,12 @@ describe("enrichSessionPR", () => {
       projectId: "test",
       status: "working",
       activity: "active",
+      activitySignal: {
+        state: "valid",
+        activity: "active",
+        timestamp: new Date().toISOString(),
+        source: "native",
+      },
       branch: "feat/test",
       issueId: null,
       issueUrl: null,
@@ -727,6 +862,12 @@ describe("enrichSessionIssueTitle", () => {
       projectId: "test",
       status: "working",
       activity: "active",
+      activitySignal: {
+        state: "valid",
+        activity: "active",
+        timestamp: new Date().toISOString(),
+        source: "native",
+      },
       branch: "feat/test",
       issueId: null,
       issueUrl: null,
@@ -933,6 +1074,41 @@ describe("enrichSessionsMetadata", () => {
     expect(dashboard.issueTitle).toBe("Fix auth bug");
   });
 
+  it("starts issue-title fetches before agent summaries finish", async () => {
+    let resolveSummary: ((value: { summary: string; summaryIsFallback: false; agentSessionId: string }) => void) | null = null;
+
+    const tracker = mockTracker("Fix auth bug");
+    const agent = {
+      ...mockAgent(),
+      getSessionInfo: vi.fn().mockImplementation(
+        () => new Promise((resolve) => {
+          resolveSummary = resolve;
+        }),
+      ),
+    } as Agent;
+    const registry = mockRegistry(tracker, agent);
+
+    const core = createCoreSession({ issueId: `${urlBase}-parallel` });
+    const dashboard = sessionToDashboard(core);
+
+    const enrichmentPromise = enrichSessionsMetadata([core], [dashboard], testConfig, registry);
+    await Promise.resolve();
+
+    expect(tracker.getIssue).toHaveBeenCalledTimes(1);
+    expect(dashboard.issueLabel).toBe("#42");
+    expect(dashboard.summary).toBeNull();
+
+    resolveSummary?.({
+      summary: "Implementing auth fix",
+      summaryIsFallback: false,
+      agentSessionId: "abc",
+    });
+    await enrichmentPromise;
+
+    expect(dashboard.summary).toBe("Implementing auth fix");
+    expect(dashboard.issueTitle).toBe("Fix auth bug");
+  });
+
   it("should skip sessions without issue URLs", async () => {
     const tracker = mockTracker();
     const agent = mockAgent();
@@ -1073,6 +1249,61 @@ describe("enrichSessionsMetadata", () => {
   });
 });
 
+describe("enrichSessionsMetadataFast", () => {
+  it("should enrich issue labels and agent summaries but NOT issue titles", async () => {
+    const urlBase = "https://github.com/test/repo/issues/fast";
+    const tracker: Tracker = {
+      name: "mock-tracker",
+      getIssue: vi.fn().mockResolvedValue({ id: "99", title: "Should not be called", url: urlBase }),
+      issueLabel: vi.fn().mockReturnValue("#99"),
+    } as unknown as Tracker;
+    const agent: Agent = {
+      getSessionInfo: vi.fn().mockResolvedValue({
+        summary: "Fast summary",
+        summaryIsFallback: false,
+        agentSessionId: "abc",
+      }),
+    } as unknown as Agent;
+    const registry = {
+      get: vi.fn().mockImplementation((slot: string) => {
+        if (slot === "tracker") return tracker;
+        if (slot === "agent") return agent;
+        return null;
+      }),
+    } as unknown as PluginRegistry;
+
+    const config: OrchestratorConfig = {
+      projects: {
+        test: {
+          path: "/test",
+          repo: "test/repo",
+          defaultBranch: "main",
+          sessionPrefix: "test-",
+          tracker: { plugin: "mock-tracker" },
+        },
+      } as Record<string, ProjectConfig>,
+      defaults: { agent: "mock-agent", runtime: "tmux" },
+      configPath: "/test/config.yaml",
+    } as OrchestratorConfig;
+
+    const core = createCoreSession({
+      issueId: `${urlBase}-fast`,
+      agentInfo: undefined,
+    });
+    const dashboard = sessionToDashboard(core);
+
+    await enrichSessionsMetadataFast([core], [dashboard], config, registry);
+
+    // Issue label should be set (synchronous)
+    expect(dashboard.issueLabel).toBe("#99");
+    // Agent summary should be set (local I/O)
+    expect(dashboard.summary).toBe("Fast summary");
+    // Issue title should NOT be set (tracker API is not called by fast path)
+    expect(dashboard.issueTitle).toBeNull();
+    expect(tracker.getIssue).not.toHaveBeenCalled();
+  });
+});
+
 describe("computeStats", () => {
   function makeDashboard(overrides: Partial<DashboardSession> = {}): DashboardSession {
     return {
@@ -1134,6 +1365,76 @@ describe("computeStats", () => {
   });
 });
 
+describe("listDashboardOrchestrators (issue #1048)", () => {
+  // ProjectConfig only needs the fields the function reads.
+  const projects = {
+    "my-app": { name: "My App", sessionPrefix: "app" },
+  } as unknown as Record<string, ProjectConfig>;
+
+  it("excludes stale {projectId}-orchestrator legacy records that lack role metadata", () => {
+    // Pre-numbered AO version wrote bare-named records without `role`. After
+    // tightening isOrchestratorSession, these must NOT leak into the dashboard's
+    // orchestrator list, otherwise the dashboard link points at a stale id while
+    // the CLI prints a different (numbered) id.
+    const sessions: Session[] = [
+      createCoreSession({
+        id: "my-app-orchestrator", // legacy bare name
+        projectId: "my-app",
+        metadata: {}, // no role stamp
+      }),
+    ];
+
+    const result = listDashboardOrchestrators(sessions, projects);
+
+    expect(result).toEqual([]);
+  });
+
+  it("includes the numbered live orchestrator with the matching id", () => {
+    const sessions: Session[] = [
+      createCoreSession({
+        id: "app-orchestrator-3",
+        projectId: "my-app",
+        metadata: { role: "orchestrator" },
+      }),
+    ];
+
+    const result = listDashboardOrchestrators(sessions, projects);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      id: "app-orchestrator-3",
+      projectId: "my-app",
+      projectName: "My App",
+    });
+  });
+
+  it("still includes legacy bare records when they have explicit role metadata", () => {
+    // When `role: orchestrator` is explicitly stamped on a record,
+    // `isOrchestratorSession` honors it unconditionally — the id shape check
+    // is a fallback, not a gate.
+    //
+    // Note: for this specific fixture (id `my-app-orchestrator`, sessionPrefix
+    // `app`), the SM repair-on-read path does NOT stamp role (wrong prefix —
+    // see `isRepairableOrchestratorRecord`). This test passes in a synthetic
+    // role-stamped session directly to exercise the explicit-role branch,
+    // which matters for records that got their role from some other source
+    // (hand-crafted metadata, external tooling, or a correct-prefix bare
+    // record that the repair path did stamp).
+    const sessions: Session[] = [
+      createCoreSession({
+        id: "my-app-orchestrator",
+        projectId: "my-app",
+        metadata: { role: "orchestrator" },
+      }),
+    ];
+
+    const result = listDashboardOrchestrators(sessions, projects);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe("my-app-orchestrator");
+  });
+});
+
 describe("basicPRToDashboard defaults", () => {
   it("should not look like failing CI", () => {
     const pr = createPRInfo();
@@ -1155,11 +1456,12 @@ describe("basicPRToDashboard defaults", () => {
     expect(dashboard.pr?.reviewDecision).not.toBe("changes_requested");
   });
 
-  it("should have explicit blocker indicating data not loaded", () => {
+  it("should mark unenriched PR with enriched: false", () => {
     const pr = createPRInfo();
     const coreSession = createCoreSession({ pr });
     const dashboard = sessionToDashboard(coreSession);
 
-    expect(dashboard.pr?.mergeability.blockers).toContain("Data not loaded");
+    expect(dashboard.pr?.enriched).toBe(false);
+    expect(dashboard.pr?.mergeability.blockers).toEqual([]);
   });
 });

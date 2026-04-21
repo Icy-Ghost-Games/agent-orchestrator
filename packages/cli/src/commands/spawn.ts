@@ -4,21 +4,16 @@ import type { Command } from "commander";
 import { resolve } from "node:path";
 import {
   loadConfig,
-  decompose,
-  getLeaves,
-  getSiblings,
-  formatPlanTree,
   TERMINAL_STATUSES,
   type OrchestratorConfig,
-  type DecomposerConfig,
-  DEFAULT_DECOMPOSER_CONFIG,
-} from "@composio/ao-core";
+} from "@aoagents/ao-core";
+import { DEFAULT_PORT } from "../lib/constants.js";
 import { exec } from "../lib/shell.js";
 import { banner } from "../lib/format.js";
 import { getSessionManager } from "../lib/create-session-manager.js";
-import { ensureLifecycleWorker } from "../lib/lifecycle-service.js";
 import { preflight } from "../lib/preflight.js";
 import { findProjectForDirectory } from "../lib/project-resolution.js";
+import { getRunning } from "../lib/running-state.js";
 
 /**
  * Auto-detect the project ID from the config.
@@ -60,6 +55,32 @@ interface SpawnClaimOptions {
 }
 
 /**
+ * Lifecycle polling runs in-process inside the long-lived `ao start` process.
+ * `ao spawn` is a one-shot CLI — it can't start polling in its own process
+ * (the interval would keep the CLI alive forever and duplicate work). Warn
+ * when no `ao start` is running, or when the running instance isn't covering
+ * this project (e.g. `ao start A` then `ao spawn` in B).
+ */
+async function warnIfAONotRunning(projectId: string): Promise<void> {
+  const running = await getRunning();
+  if (!running) {
+    console.log(
+      chalk.yellow(
+        "⚠ AO is not running — lifecycle polling is inactive. Run `ao start` so the new session is tracked.",
+      ),
+    );
+    return;
+  }
+  if (!running.projects.includes(projectId)) {
+    console.log(
+      chalk.yellow(
+        `⚠ The running AO instance (pid ${running.pid}) is not polling project "${projectId}". Run \`ao start ${projectId}\` so the new session is tracked.`,
+      ),
+    );
+  }
+}
+
+/**
  * Run pre-flight checks for a project once, before any sessions are spawned.
  * Validates runtime and tracker prerequisites so failures surface immediately
  * rather than repeating per-session in a batch.
@@ -89,6 +110,7 @@ async function spawnSession(
   openTab?: boolean,
   agent?: string,
   claimOptions?: SpawnClaimOptions,
+  prompt?: string,
 ): Promise<string> {
   const spinner = ora("Creating session").start();
 
@@ -96,13 +118,19 @@ async function spawnSession(
     const sm = await getSessionManager(config);
     spinner.text = "Spawning session via core";
 
+    // Validate and sanitize prompt (strip newlines to prevent metadata injection)
+    const sanitizedPrompt = prompt?.replace(/[\r\n]/g, " ").trim() || undefined;
+    if (sanitizedPrompt && sanitizedPrompt.length > 4096) {
+      throw new Error("Prompt must be at most 4096 characters");
+    }
+
     const session = await sm.spawn({
       projectId,
       issueId,
       agent,
+      prompt: sanitizedPrompt,
     });
 
-    let branchStr = session.branch ?? "";
     let claimedPrUrl: string | null = null;
 
     if (claimOptions?.claimPr) {
@@ -111,7 +139,6 @@ async function spawnSession(
         const claimResult = await sm.claimPR(session.id, claimOptions.claimPr, {
           assignOnGithub: claimOptions.assignOnGithub,
         });
-        branchStr = claimResult.pr.branch;
         claimedPrUrl = claimResult.pr.url;
       } catch (err) {
         throw new Error(
@@ -121,20 +148,17 @@ async function spawnSession(
       }
     }
 
+    const issueLabel = issueId ? ` for issue #${issueId}` : "";
+    const claimLabel = claimedPrUrl ? ` (claimed ${claimedPrUrl})` : "";
+    const port = config.port ?? DEFAULT_PORT;
     spinner.succeed(
-      claimedPrUrl
-        ? `Session ${chalk.green(session.id)} created and claimed PR`
-        : `Session ${chalk.green(session.id)} created`,
+      `Session ${chalk.green(session.id)} spawned${issueLabel}${claimLabel}`,
     );
-
-    console.log(`  Worktree: ${chalk.dim(session.workspacePath ?? "-")}`);
-    if (branchStr) console.log(`  Branch:   ${chalk.dim(branchStr)}`);
-    if (claimedPrUrl) console.log(`  PR:       ${chalk.dim(claimedPrUrl)}`);
+    console.log(`  View:     ${chalk.dim(`http://localhost:${port}/sessions/${session.id}`)}`);
 
     // Warn if prompt delivery failed (for post-launch agents like Claude Code)
     const promptDelivered = session.metadata?.promptDelivered;
     if (promptDelivered === "false") {
-      console.log();
       console.warn(
         chalk.yellow(
           `  ⚠ Prompt delivery failed — agent may be idle.\n` +
@@ -143,14 +167,10 @@ async function spawnSession(
       );
     }
 
-    // Show the tmux name for attaching (stored in metadata or runtimeHandle)
-    const tmuxTarget = session.runtimeHandle?.id ?? session.id;
-    console.log(`  Attach:   ${chalk.dim(`tmux attach -t ${tmuxTarget}`)}`);
-    console.log();
-
     // Open terminal tab if requested
     if (openTab) {
       try {
+        const tmuxTarget = session.runtimeHandle?.id ?? session.id;
         await exec("open-iterm-tab", [tmuxTarget]);
       } catch {
         // Terminal plugin not available
@@ -176,8 +196,7 @@ export function registerSpawn(program: Command): void {
     .option("--agent <name>", "Override the agent plugin (e.g. codex, claude-code)")
     .option("--claim-pr <pr>", "Immediately claim an existing PR for the spawned session")
     .option("--assign-on-github", "Assign the claimed PR to the authenticated GitHub user")
-    .option("--decompose", "Decompose issue into subtasks before spawning")
-    .option("--max-depth <n>", "Max decomposition depth (default: 3)")
+    .option("--prompt <text>", "Initial prompt/instructions for the agent (use instead of an issue)")
     .action(
       async (
         first: string | undefined,
@@ -187,8 +206,7 @@ export function registerSpawn(program: Command): void {
           agent?: string;
           claimPr?: string;
           assignOnGithub?: boolean;
-          decompose?: boolean;
-          maxDepth?: string;
+          prompt?: string;
         },
       ) => {
         // Catch old two-arg usage: ao spawn <project> <issue>
@@ -238,61 +256,9 @@ export function registerSpawn(program: Command): void {
 
         try {
           await runSpawnPreflight(config, projectId, claimOptions);
-          await ensureLifecycleWorker(config, projectId);
+          await warnIfAONotRunning(projectId);
 
-          if (opts.decompose && issueId) {
-            // Decompose the issue before spawning
-            const project = config.projects[projectId];
-            const decompConfig: DecomposerConfig = {
-              ...DEFAULT_DECOMPOSER_CONFIG,
-              ...(project.decomposer ?? {}),
-              maxDepth: opts.maxDepth
-                ? parseInt(opts.maxDepth, 10)
-                : (project.decomposer?.maxDepth ?? 3),
-            };
-
-            const spinner = ora("Decomposing task...").start();
-            const issueTitle = issueId;
-
-            const plan = await decompose(issueTitle, decompConfig);
-            const leaves = getLeaves(plan.tree);
-            spinner.succeed(`Decomposed into ${chalk.bold(String(leaves.length))} subtasks`);
-
-            console.log();
-            console.log(chalk.dim(formatPlanTree(plan.tree)));
-            console.log();
-
-            if (leaves.length <= 1) {
-              console.log(chalk.yellow("Task is atomic — spawning directly."));
-              await spawnSession(config, projectId, issueId, opts.open, opts.agent, claimOptions);
-            } else {
-              // Create child issues and spawn sessions with lineage context
-              const sm = await getSessionManager(config);
-              console.log(chalk.bold(`Spawning ${leaves.length} sessions with lineage context...`));
-              console.log();
-
-              for (const leaf of leaves) {
-                const siblings = getSiblings(plan.tree, leaf.id);
-                try {
-                  const session = await sm.spawn({
-                    projectId,
-                    issueId, // All work on the same parent issue for now
-                    lineage: leaf.lineage,
-                    siblings,
-                    agent: opts.agent,
-                  });
-                  console.log(`  ${chalk.green("✓")} ${session.id} — ${leaf.description}`);
-                } catch (err) {
-                  console.error(
-                    `  ${chalk.red("✗")} ${leaf.description} — ${err instanceof Error ? err.message : err}`,
-                  );
-                }
-                await new Promise((r) => setTimeout(r, 500));
-              }
-            }
-          } else {
-            await spawnSession(config, projectId, issueId, opts.open, opts.agent, claimOptions);
-          }
+          await spawnSession(config, projectId, issueId, opts.open, opts.agent, claimOptions, opts.prompt);
         } catch (err) {
           console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
           process.exit(1);
@@ -336,7 +302,7 @@ export function registerBatchSpawn(program: Command): void {
       // Pre-flight once before the loop so a missing prerequisite fails fast
       try {
         await runSpawnPreflight(config, projectId);
-        await ensureLifecycleWorker(config, projectId);
+        await warnIfAONotRunning(projectId);
       } catch (err) {
         console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
         process.exit(1);

@@ -34,6 +34,16 @@ export interface JiraIssue {
 export interface JiraTransition {
   id: string;
   name: string;
+  to?: {
+    name?: string;
+    statusCategory?: { key?: string; name?: string };
+  };
+}
+
+export interface JiraUser {
+  accountId?: string | null;
+  displayName?: string | null;
+  emailAddress?: string | null;
 }
 
 export interface JiraSearchResponse {
@@ -223,6 +233,14 @@ export class JiraClient {
     return result.transitions;
   }
 
+  /** Execute a transition by its ID directly. */
+  async executeTransition(issueKey: string, transitionId: string): Promise<void> {
+    await this.request(`issue/${encodeURIComponent(issueKey)}/transitions`, {
+      method: "POST",
+      body: JSON.stringify({ transition: { id: transitionId } }),
+    });
+  }
+
   /** Transition an issue by transition name. */
   async transitionIssue(issueKey: string, transitionName: string): Promise<void> {
     const transitions = await this.getTransitions(issueKey);
@@ -316,5 +334,68 @@ export class JiraClient {
       method: "PUT",
       body: JSON.stringify({ fields }),
     });
+  }
+
+  /** Search Jira users by query string (display name, email, or accountId). */
+  async searchUsers(query: string): Promise<JiraUser[]> {
+    return this.request<JiraUser[]>(
+      `user/search?query=${encodeURIComponent(query)}`,
+    );
+  }
+
+  /**
+   * Find a transition ID for a target AO state using Jira transition metadata
+   * and status-category/name heuristics. Returns undefined if no match found.
+   */
+  async findTransitionByState(
+    issueKey: string,
+    state: "open" | "in_progress" | "closed" | "cancelled",
+  ): Promise<string | undefined> {
+    const transitions = await this.getTransitions(issueKey);
+
+    const target = transitions.find((t) => {
+      const toName = t.to?.name?.toLowerCase() ?? "";
+      const transitionName = t.name.toLowerCase();
+      const category = t.to?.statusCategory?.key?.toLowerCase() ?? "";
+
+      if (state === "closed") {
+        // Avoid transitions to cancelled/rejected statuses
+        const cancelled = [toName, transitionName].some((n) =>
+          ["cancelled", "canceled", "rejected", "won't do", "wont do"].includes(n),
+        );
+        return (
+          !cancelled &&
+          (category === "done" ||
+            [toName, transitionName].some((n) =>
+              ["done", "closed", "resolved"].includes(n),
+            ))
+        );
+      }
+
+      if (state === "cancelled") {
+        return [toName, transitionName].some((n) =>
+          ["cancelled", "canceled", "rejected", "won't do", "wont do"].includes(n),
+        );
+      }
+
+      if (state === "in_progress") {
+        return (
+          category === "indeterminate" ||
+          [toName, transitionName].some((n) =>
+            ["in progress", "in review", "selected for development", "implementing"].includes(n),
+          )
+        );
+      }
+
+      // open
+      return (
+        category === "new" ||
+        [toName, transitionName].some((n) =>
+          ["open", "to do", "todo", "backlog", "reopen", "reopened"].includes(n),
+        )
+      );
+    });
+
+    return target?.id;
   }
 }

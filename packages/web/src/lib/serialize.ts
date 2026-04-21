@@ -1,3 +1,5 @@
+import "server-only";
+
 /**
  * Core Session → DashboardSession serialization.
  *
@@ -15,13 +17,14 @@ import {
   type ProjectConfig,
   type OrchestratorConfig,
   type PluginRegistry,
-} from "@composio/ao-core";
-import type {
-  DashboardSession,
-  DashboardPR,
-  DashboardStats,
-  DashboardOrchestratorLink,
-} from "./types.js";
+} from "@aoagents/ao-core";
+import {
+  type DashboardSession,
+  type DashboardPR,
+  type DashboardStats,
+  type DashboardOrchestratorLink,
+  getAttentionLevel,
+} from "./types";
 import { TTLCache, prCache, prCacheKey, type PREnrichmentData } from "./cache";
 
 /** Cache for issue titles (5 min TTL — issue titles rarely change) */
@@ -45,28 +48,153 @@ export function resolveProject(
   return firstKey ? projects[firstKey] : undefined;
 }
 
+function humanizeLifecycleToken(token: string): string {
+  return token.replace(/_/g, " ");
+}
+
+function buildLifecycleLabel(state: string, reason: string): string {
+  if (state === "idle" && reason === "merged_waiting_decision") {
+    return "merged, waiting decision";
+  }
+  if (state === "none") {
+    return "not created";
+  }
+  if (state === "alive") {
+    return "alive";
+  }
+  if (state === "missing") {
+    return "missing";
+  }
+  return humanizeLifecycleToken(state);
+}
+
+function buildLifecycleSummary(session: Session): string {
+  const { lifecycle } = session;
+  if (lifecycle.session.state === "detecting") {
+    return `Detecting runtime truth (${humanizeLifecycleToken(lifecycle.session.reason)})`;
+  }
+  if (lifecycle.pr.state === "merged") {
+    return session.metadata["mergedPendingCleanupSince"]
+      ? "PR merged; worker session will be cleaned up automatically"
+      : "PR merged";
+  }
+  if (lifecycle.pr.state === "closed") {
+    return "PR closed without merge";
+  }
+  if (lifecycle.pr.reason === "ci_failing") {
+    return "PR is open and CI is failing";
+  }
+  if (lifecycle.pr.reason === "changes_requested") {
+    return "PR is open with requested changes";
+  }
+  if (lifecycle.pr.reason === "review_pending") {
+    return "PR is open and waiting on review";
+  }
+  return `Session ${humanizeLifecycleToken(lifecycle.session.state)} (${humanizeLifecycleToken(lifecycle.session.reason)})`;
+}
+
+function buildLifecycleGuidance(session: Session): string | null {
+  const { lifecycle, metadata } = session;
+  if (lifecycle.session.state !== "detecting") {
+    return null;
+  }
+  const attempts = Number.parseInt(metadata["detectingAttempts"] ?? "0", 10);
+  const normalizedAttempts = Number.isFinite(attempts) ? attempts : 0;
+  if (metadata["detectingEscalatedAt"]) {
+    return "Detection retries exhausted. Inspect runtime evidence or restore the session manually.";
+  }
+  if (normalizedAttempts > 0) {
+    return `Checking runtime and process evidence now. Retry ${normalizedAttempts} is in progress.`;
+  }
+  return "Checking runtime and process evidence now.";
+}
+
+function buildDashboardLifecycle(session: Session): NonNullable<DashboardSession["lifecycle"]> {
+  const lifecycle = session.lifecycle;
+  return {
+    sessionState: lifecycle.session.state,
+    sessionReason: lifecycle.session.reason,
+    prState: lifecycle.pr.state,
+    prReason: lifecycle.pr.reason,
+    runtimeState: lifecycle.runtime.state,
+    runtimeReason: lifecycle.runtime.reason,
+    session: {
+      state: lifecycle.session.state,
+      reason: lifecycle.session.reason,
+      label: buildLifecycleLabel(lifecycle.session.state, lifecycle.session.reason),
+      reasonLabel: humanizeLifecycleToken(lifecycle.session.reason),
+      startedAt: lifecycle.session.startedAt,
+      completedAt: lifecycle.session.completedAt,
+      terminatedAt: lifecycle.session.terminatedAt,
+      lastTransitionAt: lifecycle.session.lastTransitionAt,
+    },
+    pr: {
+      state: lifecycle.pr.state,
+      reason: lifecycle.pr.reason,
+      label: buildLifecycleLabel(lifecycle.pr.state, lifecycle.pr.reason),
+      reasonLabel: humanizeLifecycleToken(lifecycle.pr.reason),
+      number: lifecycle.pr.number,
+      url: lifecycle.pr.url,
+      lastObservedAt: lifecycle.pr.lastObservedAt,
+    },
+    runtime: {
+      state: lifecycle.runtime.state,
+      reason: lifecycle.runtime.reason,
+      label: buildLifecycleLabel(lifecycle.runtime.state, lifecycle.runtime.reason),
+      reasonLabel: humanizeLifecycleToken(lifecycle.runtime.reason),
+      lastObservedAt: lifecycle.runtime.lastObservedAt,
+    },
+    legacyStatus: session.status,
+    evidence: session.metadata["lifecycleEvidence"] ?? null,
+    detectingAttempts: Number.parseInt(session.metadata["detectingAttempts"] ?? "0", 10) || 0,
+    detectingEscalatedAt: session.metadata["detectingEscalatedAt"] ?? null,
+    summary: buildLifecycleSummary(session),
+    guidance: buildLifecycleGuidance(session),
+  };
+}
+
+export function refreshDashboardSessionDerivedFields(session: DashboardSession): DashboardSession {
+  session.attentionLevel = getAttentionLevel(session);
+  return session;
+}
+
 /** Convert a core Session to a DashboardSession (without PR/issue enrichment). */
 export function sessionToDashboard(session: Session): DashboardSession {
   const agentSummary = session.agentInfo?.summary;
   const summary = agentSummary ?? session.metadata["summary"] ?? null;
 
-  return {
+  return refreshDashboardSessionDerivedFields({
     id: session.id,
     projectId: session.projectId,
     status: session.status,
     activity: session.activity,
+    activitySignal: {
+      state: session.activitySignal.state,
+      activity: session.activitySignal.activity,
+      timestamp: session.activitySignal.timestamp?.toISOString() ?? null,
+      source: session.activitySignal.source,
+      detail: session.activitySignal.detail,
+    },
+    lifecycle: buildDashboardLifecycle(session),
     branch: session.branch,
     issueId: session.issueId, // Deprecated: kept for backwards compatibility
     issueUrl: session.issueId, // issueId is actually the full URL
     issueLabel: null, // Will be enriched by enrichSessionIssue()
     issueTitle: null, // Will be enriched by enrichSessionIssueTitle()
+    userPrompt: session.metadata["userPrompt"] ?? null,
     summary,
     summaryIsFallback: agentSummary ? (session.agentInfo?.summaryIsFallback ?? false) : false,
     createdAt: session.createdAt.toISOString(),
     lastActivityAt: session.lastActivityAt.toISOString(),
-    pr: session.pr ? basicPRToDashboard(session.pr) : null,
+    pr: session.pr
+      ? {
+          ...basicPRToDashboard(session.pr),
+          state: normalizeDashboardPRState(session.lifecycle.pr.state),
+        }
+      : null,
     metadata: session.metadata,
-  };
+    agentReportAudit: [],
+  });
 }
 
 export function listDashboardOrchestrators(
@@ -118,11 +246,23 @@ function basicPRToDashboard(pr: PRInfo): DashboardPR {
       ciPassing: false, // Conservative default
       approved: false,
       noConflicts: true, // Optimistic default (conflicts are rare)
-      blockers: ["Data not loaded"], // Explicit blocker
+      blockers: [],
     },
     unresolvedThreads: 0,
     unresolvedComments: [],
+    enriched: false,
   };
+}
+
+function normalizeDashboardPRState(state: Session["lifecycle"]["pr"]["state"]): DashboardPR["state"] {
+  switch (state) {
+    case "merged":
+      return "merged";
+    case "closed":
+      return "closed";
+    default:
+      return "open";
+  }
 }
 
 /**
@@ -152,6 +292,8 @@ export async function enrichSessionPR(
     dashboard.pr.mergeability = cached.mergeability;
     dashboard.pr.unresolvedThreads = cached.unresolvedThreads;
     dashboard.pr.unresolvedComments = cached.unresolvedComments;
+    dashboard.pr.enriched = true;
+    refreshDashboardSessionDerivedFields(dashboard);
     return true;
   }
 
@@ -234,6 +376,9 @@ export async function enrichSessionPR(
     }));
   }
 
+  // Mark as enriched — we attempted SCM API calls and applied whatever succeeded
+  dashboard.pr.enriched = true;
+
   // Add rate-limit warning blocker if most requests failed
   // (but we still applied any successful results above)
   if (
@@ -260,6 +405,7 @@ export async function enrichSessionPR(
       unresolvedComments: dashboard.pr.unresolvedComments,
     };
     prCache.set(cacheKey, rateLimitedData, 60 * 60_000); // 60 min — GitHub rate limit resets hourly
+    refreshDashboardSessionDerivedFields(dashboard);
     return true;
   }
 
@@ -276,6 +422,7 @@ export async function enrichSessionPR(
     unresolvedComments: dashboard.pr.unresolvedComments,
   };
   prCache.set(cacheKey, cacheData);
+  refreshDashboardSessionDerivedFields(dashboard);
   return true;
 }
 
@@ -371,20 +518,37 @@ export async function enrichSessionIssueTitle(
 }
 
 /**
- * Enrich dashboard sessions with metadata (issue labels, agent summaries, issue titles).
- * Orchestrates sync + async enrichment in parallel. Does NOT enrich PR data — callers
- * handle that separately since strategies differ (e.g. terminal-session cache optimization).
+ * Fast-path metadata enrichment: issue labels (sync) + agent summaries (local I/O).
+ * Does NOT call tracker API for issue titles — use enrichSessionsMetadata() for full enrichment.
  */
-export async function enrichSessionsMetadata(
+export async function enrichSessionsMetadataFast(
   coreSessions: Session[],
   dashboardSessions: DashboardSession[],
   config: OrchestratorConfig,
   registry: PluginRegistry,
 ): Promise<void> {
-  // Resolve projects once per session (avoids repeated Object.entries lookups)
+  const { summaryPromises } = prepareSessionMetadataEnrichment(
+    coreSessions,
+    dashboardSessions,
+    config,
+    registry,
+  );
+
+  await Promise.allSettled(summaryPromises);
+}
+
+function prepareSessionMetadataEnrichment(
+  coreSessions: Session[],
+  dashboardSessions: DashboardSession[],
+  config: OrchestratorConfig,
+  registry: PluginRegistry,
+): {
+  projects: Array<ProjectConfig | undefined>;
+  summaryPromises: Promise<void>[];
+} {
   const projects = coreSessions.map((core) => resolveProject(core, config.projects));
 
-  // Enrich issue labels (synchronous — must run before async title enrichment)
+  // Issue labels (synchronous string parsing, no API calls)
   projects.forEach((project, i) => {
     if (!dashboardSessions[i].issueUrl || !project?.tracker?.plugin) return;
     const tracker = registry.get<Tracker>("tracker", project.tracker.plugin);
@@ -392,7 +556,7 @@ export async function enrichSessionsMetadata(
     enrichSessionIssue(dashboardSessions[i], tracker, project);
   });
 
-  // Enrich agent summaries (reads agent's JSONL — local I/O, not an API call)
+  // Agent summaries (local disk I/O — reads agent JSONL)
   const summaryPromises = coreSessions.map((core, i) => {
     if (dashboardSessions[i].summary) return Promise.resolve();
     const agentName = projects[i]?.agent ?? config.defaults.agent;
@@ -402,7 +566,27 @@ export async function enrichSessionsMetadata(
     return enrichSessionAgentSummary(dashboardSessions[i], core, agent);
   });
 
-  // Enrich issue titles (fetches from tracker API, cached with TTL)
+  return { projects, summaryPromises };
+}
+
+/**
+ * Full metadata enrichment: issue labels, agent summaries, AND issue titles (tracker API).
+ * Used by /api/sessions for complete data. For SSR fast path, use enrichSessionsMetadataFast().
+ */
+export async function enrichSessionsMetadata(
+  coreSessions: Session[],
+  dashboardSessions: DashboardSession[],
+  config: OrchestratorConfig,
+  registry: PluginRegistry,
+): Promise<void> {
+  const { projects, summaryPromises } = prepareSessionMetadataEnrichment(
+    coreSessions,
+    dashboardSessions,
+    config,
+    registry,
+  );
+
+  // Issue-title fetches depend on labels being set, but can run in parallel with summary I/O.
   const issueTitlePromises = projects.map((project, i) => {
     if (!dashboardSessions[i].issueUrl || !dashboardSessions[i].issueLabel) {
       return Promise.resolve();

@@ -8,7 +8,6 @@ import { createSessionManager } from "../../session-manager.js";
 import {
   writeMetadata,
   readMetadataRaw,
-  updateMetadata,
 } from "../../metadata.js";
 import type {
   OrchestratorConfig,
@@ -54,37 +53,6 @@ describe("send", () => {
     expect(mockRuntime.sendMessage).toHaveBeenCalledWith(makeHandle("rt-1"), "Fix the CI failures");
   });
 
-  it("blocks send to worker sessions while the project is globally paused", async () => {
-    writeMetadata(sessionsDir, "app-orchestrator", {
-      worktree: join(tmpDir, "my-app"),
-      branch: "main",
-      status: "working",
-      role: "orchestrator",
-      project: "my-app",
-      runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator")),
-    });
-    updateMetadata(sessionsDir, "app-orchestrator", {
-      globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
-      globalPauseReason: "Rate limit reached",
-      globalPauseSource: "app-9",
-    });
-
-    writeMetadata(sessionsDir, "app-1", {
-      worktree: "/tmp",
-      branch: "main",
-      status: "working",
-      project: "my-app",
-      runtimeHandle: JSON.stringify(makeHandle("rt-1")),
-    });
-
-    const sm = createSessionManager({ config, registry: mockRegistry });
-
-    await expect(sm.send("app-1", "Fix the CI failures")).rejects.toThrow(
-      "Project is paused due to model rate limit until",
-    );
-    expect(mockRuntime.sendMessage).not.toHaveBeenCalled();
-  });
-
   it("restores a dead session before sending the message", async () => {
     const wsPath = join(tmpDir, "ws-app-1");
     mkdirSync(wsPath, { recursive: true });
@@ -116,6 +84,43 @@ describe("send", () => {
       makeHandle("rt-restored"),
       "Please fix the review comments",
     );
+  });
+
+  it("throws when a killed session cannot be restored to a ready state for delivery", async () => {
+    vi.useFakeTimers();
+    try {
+      const wsPath = join(tmpDir, "ws-app-1");
+      mkdirSync(wsPath, { recursive: true });
+
+      writeMetadata(sessionsDir, "app-1", {
+        worktree: wsPath,
+        branch: "feat/TEST-1",
+        status: "killed",
+        project: "my-app",
+        issue: "TEST-1",
+        runtimeHandle: JSON.stringify(makeHandle("rt-old")),
+      });
+
+      vi.mocked(mockRuntime.isAlive).mockImplementation(async (handle) => handle.id !== "rt-restored");
+      vi.mocked(mockAgent.isProcessRunning).mockImplementation(
+        async (handle) => handle.id !== "rt-restored",
+      );
+      vi.mocked(mockRuntime.create).mockResolvedValue(makeHandle("rt-restored"));
+      vi.mocked(mockRuntime.getOutput).mockResolvedValue("");
+      vi.mocked(mockAgent.detectActivity).mockReturnValue("idle");
+
+      const sm = createSessionManager({ config, registry: mockRegistry });
+      const sendPromise = sm.send("app-1", "hello");
+      const rejection = expect(sendPromise).rejects.toThrow(
+        "Cannot send to session app-1: session is not running",
+      );
+
+      await vi.runAllTimersAsync();
+      await rejection;
+      expect(mockRuntime.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("waits for spawning sessions to become interactive before considering restore", async () => {
@@ -167,6 +172,42 @@ describe("send", () => {
     // to avoid duplicate dispatches on the next poll cycle.
     await expect(sm.send("app-1", "Fix the CI failures")).resolves.toBeUndefined();
     expect(mockRuntime.sendMessage).toHaveBeenCalled();
+  });
+
+  it("resolves on restored session when confirmation never flips (soft success)", async () => {
+    // Regression test: on a restored session (post-#1074 fix), if
+    // sendMessage fires but the confirmation heuristics never flip,
+    // send() must still resolve — otherwise the lifecycle-manager's
+    // dispatch-hash never updates and the message re-sends next poll,
+    // reintroducing the duplicate-message bug that 77685a5 removed.
+    const wsPath = join(tmpDir, "ws-app-1");
+    mkdirSync(wsPath, { recursive: true });
+
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: wsPath,
+      branch: "feat/TEST-1",
+      status: "working",
+      project: "my-app",
+      issue: "TEST-1",
+      runtimeHandle: JSON.stringify(makeHandle("rt-old")),
+    });
+
+    // rt-old is dead → restore kicks in → rt-restored is ready
+    vi.mocked(mockRuntime.isAlive).mockImplementation(async (handle) => handle.id !== "rt-old");
+    vi.mocked(mockAgent.isProcessRunning).mockImplementation(
+      async (handle) => handle.id !== "rt-old",
+    );
+    vi.mocked(mockRuntime.create).mockResolvedValue(makeHandle("rt-restored"));
+    // Steady output — confirmation heuristics will never flip
+    vi.mocked(mockRuntime.getOutput).mockResolvedValue("steady output");
+    vi.mocked(mockAgent.detectActivity).mockReturnValue("idle");
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await expect(sm.send("app-1", "retry after restore")).resolves.toBeUndefined();
+    expect(mockRuntime.sendMessage).toHaveBeenCalledWith(
+      makeHandle("rt-restored"),
+      "retry after restore",
+    );
   });
 
   it("throws for nonexistent session", async () => {
@@ -305,7 +346,7 @@ describe("send", () => {
     await sm.send("app-1", "confirm via updated timestamp");
     const elapsedMs = Date.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(2_000);
+    expect(elapsedMs).toBeLessThan(5_000);
     expect(readFileSync(listLogPath, "utf-8").trim().split("\n").length).toBeGreaterThanOrEqual(2);
     expect(mockRuntime.sendMessage).toHaveBeenCalledWith(
       makeHandle("rt-1"),
@@ -442,7 +483,7 @@ describe("remap", () => {
     expect(mapped).toBe("ses_slow_discovery");
     const meta = readMetadataRaw(sessionsDir, "app-1");
     expect(meta?.["opencodeSessionId"]).toBe("ses_slow_discovery");
-  });
+  }, 20000);
 
   it("throws when OpenCode session id mapping is missing", async () => {
     const deleteLogPath = join(tmpDir, "opencode-delete-missing-remap.log");

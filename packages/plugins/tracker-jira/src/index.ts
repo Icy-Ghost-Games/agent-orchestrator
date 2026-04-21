@@ -6,8 +6,8 @@ import type {
   IssueUpdate,
   CreateIssueInput,
   ProjectConfig,
-} from "@composio/ao-core";
-import { JiraClient, adfToMarkdown, type JiraIssue } from "./jira-client.js";
+} from "@aoagents/ao-core";
+import { JiraClient, adfToMarkdown, type JiraIssue, type JiraUser } from "./jira-client.js";
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -30,6 +30,14 @@ function getBaseUrl(project: ProjectConfig): string {
     process.env.JIRA_BASE_URL ??
     ""
   );
+}
+
+function getEmail(project: ProjectConfig): string | undefined {
+  return (project.tracker?.["email"] as string | undefined) ?? process.env.JIRA_EMAIL;
+}
+
+function getApiToken(project: ProjectConfig): string | undefined {
+  return (project.tracker?.["apiToken"] as string | undefined) ?? process.env.JIRA_API_TOKEN;
 }
 
 function getProjectKey(project: ProjectConfig): string {
@@ -140,6 +148,31 @@ function extractSprintNumber(sprintName: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Assignee resolution — exact match only, skip on ambiguity
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a human-readable assignee string (display name, email, or accountId)
+ * to a Jira Cloud accountId. Returns undefined when there is no single exact
+ * match — callers should skip the assignee write rather than risk a wrong
+ * assignment.
+ */
+async function resolveAssigneeAccountId(
+  client: JiraClient,
+  assignee: string,
+): Promise<string | undefined> {
+  const users = await client.searchUsers(assignee);
+  const lower = assignee.toLowerCase();
+  const exactMatches = users.filter((u: JiraUser) =>
+    [u.displayName, u.emailAddress, u.accountId].some(
+      (value) => typeof value === "string" && value.toLowerCase() === lower,
+    ),
+  );
+  if (exactMatches.length !== 1) return undefined;
+  return exactMatches[0]?.accountId ?? undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Tracker implementation
 // ---------------------------------------------------------------------------
 
@@ -151,11 +184,11 @@ export function create(): Tracker {
 
   function getClient(project: ProjectConfig): JiraClient {
     const baseUrl = getBaseUrl(project);
-    const email = process.env.JIRA_EMAIL;
-    const apiToken = process.env.JIRA_API_TOKEN;
+    const email = getEmail(project);
+    const apiToken = getApiToken(project);
     if (!baseUrl) throw new Error("Jira tracker: baseUrl is required (project.tracker.baseUrl or JIRA_BASE_URL env)");
-    if (!email) throw new Error("Jira tracker: JIRA_EMAIL env var is required");
-    if (!apiToken) throw new Error("Jira tracker: JIRA_API_TOKEN env var is required");
+    if (!email) throw new Error("Jira tracker: email is required (project.tracker.email or JIRA_EMAIL env)");
+    if (!apiToken) throw new Error("Jira tracker: apiToken is required (project.tracker.apiToken or JIRA_API_TOKEN env)");
 
     // Cache key includes apiToken so rotating the token invalidates the
     // cached client (the baked-in Authorization header is otherwise stale).
@@ -296,9 +329,16 @@ export function create(): Tracker {
       const statusMap = getStatusMap(project);
 
       if (update.state) {
+        // Prefer explicit statusMap when configured, fall back to runtime
+        // transition resolution via Jira transition metadata + heuristics.
         const transitionName = statusMap[update.state];
         if (transitionName) {
           await client.transitionIssue(identifier, transitionName);
+        } else {
+          const transitionId = await client.findTransitionByState(identifier, update.state);
+          if (transitionId) {
+            await client.executeTransition(identifier, transitionId);
+          }
         }
       }
       // Labels are a single list on the Jira side, so add+remove must be
@@ -319,9 +359,13 @@ export function create(): Tracker {
         await client.updateIssue(identifier, { labels: merged });
       }
       if (update.assignee) {
-        await client.updateIssue(identifier, {
-          assignee: { accountId: update.assignee },
-        });
+        const accountId = await resolveAssigneeAccountId(client, update.assignee);
+        if (accountId) {
+          await client.updateIssue(identifier, {
+            assignee: { accountId },
+          });
+        }
+        // Skip silently when no exact match — safer than a wrong assignment.
       }
       if (update.comment) {
         await client.addComment(identifier, update.comment);
@@ -356,7 +400,11 @@ export function create(): Tracker {
         fields.labels = input.labels;
       }
       if (input.assignee) {
-        fields.assignee = { accountId: input.assignee };
+        const accountId = await resolveAssigneeAccountId(client, input.assignee);
+        if (accountId) {
+          fields.assignee = { accountId };
+        }
+        // Skip silently when no exact match — safer than a wrong assignment.
       }
 
       const result = await client.createIssue(fields);

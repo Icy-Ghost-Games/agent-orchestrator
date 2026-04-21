@@ -8,7 +8,7 @@ const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
 
 import { create, manifest, detect } from "../index.js";
-import type { ProjectConfig } from "@composio/ao-core";
+import type { ProjectConfig } from "@aoagents/ao-core";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -724,11 +724,62 @@ describe("tracker-jira plugin", () => {
       expect(body.fields.labels).not.toContain("bug");
     });
 
-    it("throws when transition not found", async () => {
+    it("throws when transition not found via statusMap", async () => {
+      // statusMap maps "closed" -> "Done", but no "Done" transition exists
       mockFetchJson({ transitions: [{ id: "21", name: "In Progress" }] });
       await expect(
         tracker.updateIssue!("TT-142", { state: "closed" }, project),
       ).rejects.toThrow('Transition "Done" not found');
+    });
+
+    it("resolves transition at runtime when no statusMap entry exists", async () => {
+      // Project without statusMap
+      const noStatusMapProject: ProjectConfig = {
+        ...project,
+        tracker: { plugin: "jira", baseUrl: "https://acme.atlassian.net", projectKey: "TT" },
+      };
+      // findTransitionByState: getTransitions (with .to metadata)
+      mockFetchJson({
+        transitions: [
+          { id: "21", name: "In Progress", to: { name: "In Progress", statusCategory: { key: "indeterminate" } } },
+          { id: "31", name: "Done", to: { name: "Done", statusCategory: { key: "done" } } },
+        ],
+      });
+      // executeTransition: POST
+      mockFetch204();
+      await tracker.updateIssue!("TT-142", { state: "closed" }, noStatusMapProject);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const body = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+      expect(body.transition.id).toBe("31");
+    });
+
+    it("updates assignee using Jira Cloud accountId payload", async () => {
+      // searchUsers returns one exact match
+      mockFetchJson([{ accountId: "acct-456", displayName: "Bob Roe" }]);
+      mockFetch204();
+      await tracker.updateIssue!("TT-142", { assignee: "Bob Roe" }, project);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const body = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+      expect(body.fields.assignee).toEqual({ accountId: "acct-456" });
+    });
+
+    it("skips assignee update when user search is ambiguous", async () => {
+      // searchUsers returns two matches with the same display name
+      mockFetchJson([
+        { accountId: "acct-123", displayName: "Alice Doe" },
+        { accountId: "acct-456", displayName: "Alice Doe" },
+      ]);
+      await tracker.updateIssue!("TT-142", { assignee: "Alice Doe" }, project);
+      // Only 1 call (user search). No PUT for assignee.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("skips assignee update when no exact match", async () => {
+      // searchUsers returns a user but their name doesn't exactly match
+      mockFetchJson([{ accountId: "acct-123", displayName: "Alice Doe" }]);
+      await tracker.updateIssue!("TT-142", { assignee: "Alice" }, project);
+      // Only 1 call (user search). No PUT for assignee.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -807,6 +858,83 @@ describe("tracker-jira plugin", () => {
       );
       const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
       expect(body.fields.labels).toEqual(["ai-agent"]);
+    });
+
+    it("creates issue with assignee resolved via accountId", async () => {
+      // searchUsers returns one exact match
+      mockFetchJson([{ accountId: "acct-789", displayName: "Carol Smith" }]);
+      mockFetchJson({ id: "10001", key: "TT-205" });
+      mockSprintResolution();
+      mockFetchJson({ ...sampleJiraIssue, key: "TT-205" });
+
+      await tracker.createIssue!(
+        { title: "Test", description: "d", assignee: "Carol Smith" },
+        project,
+      );
+      // Call 0: searchUsers, Call 1: createIssue
+      const body = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+      expect(body.fields.assignee).toEqual({ accountId: "acct-789" });
+    });
+
+    it("skips assignee on create when no exact match", async () => {
+      // searchUsers returns a user but name doesn't match exactly
+      mockFetchJson([{ accountId: "acct-123", displayName: "Alice Doe" }]);
+      mockFetchJson({ id: "10001", key: "TT-206" });
+      mockSprintResolution();
+      mockFetchJson({ ...sampleJiraIssue, key: "TT-206" });
+
+      await tracker.createIssue!(
+        { title: "Test", description: "d", assignee: "Alice" },
+        project,
+      );
+      const body = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+      expect(body.fields.assignee).toBeUndefined();
+    });
+  });
+
+  // ---- per-project credentials --------------------------------------------
+
+  describe("per-project credential overrides", () => {
+    it("reads email and apiToken from project.tracker config", async () => {
+      delete process.env.JIRA_EMAIL;
+      delete process.env.JIRA_API_TOKEN;
+      const projectWithCreds: ProjectConfig = {
+        ...project,
+        tracker: {
+          ...project.tracker!,
+          email: "project@acme.com",
+          apiToken: "project-token",
+        },
+      };
+      const t = create();
+      mockSprintResolution();
+      mockFetchJson(sampleJiraIssue);
+      const issue = await t.getIssue("TT-142", projectWithCreds);
+      expect(issue.id).toBe("TT-142");
+      // Verify the auth header used project-level creds
+      const auth = fetchMock.mock.calls[0][1].headers.Authorization;
+      expect(auth).toContain(
+        Buffer.from("project@acme.com:project-token").toString("base64"),
+      );
+    });
+
+    it("project-level creds override env vars", async () => {
+      const projectWithCreds: ProjectConfig = {
+        ...project,
+        tracker: {
+          ...project.tracker!,
+          email: "override@acme.com",
+          apiToken: "override-token",
+        },
+      };
+      const t = create();
+      mockSprintResolution();
+      mockFetchJson(sampleJiraIssue);
+      await t.getIssue("TT-142", projectWithCreds);
+      const auth = fetchMock.mock.calls[0][1].headers.Authorization;
+      expect(auth).toContain(
+        Buffer.from("override@acme.com:override-token").toString("base64"),
+      );
     });
   });
 });

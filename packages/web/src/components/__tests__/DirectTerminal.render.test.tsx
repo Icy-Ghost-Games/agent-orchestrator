@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DirectTerminal } from "../DirectTerminal";
 
@@ -76,7 +76,7 @@ class MockWebSocket {
   close() {}
 }
 
-vi.mock("xterm", () => ({
+vi.mock("@xterm/xterm", () => ({
   Terminal: MockTerminal,
 }));
 
@@ -88,6 +88,19 @@ vi.mock("@xterm/addon-web-links", () => ({
   WebLinksAddon: MockWebLinksAddon,
 }));
 
+vi.mock("@/hooks/useMux", () => ({
+  useMux: () => ({
+    subscribeTerminal: vi.fn(() => vi.fn()),
+    writeTerminal: vi.fn(),
+    openTerminal: vi.fn(),
+    closeTerminal: vi.fn(),
+    resizeTerminal: vi.fn(),
+    status: "connected",
+    sessions: [],
+    terminals: [],
+  }),
+}));
+
 describe("DirectTerminal render", () => {
   beforeEach(() => {
     searchParams = new URLSearchParams();
@@ -95,7 +108,14 @@ describe("DirectTerminal render", () => {
     MockWebSocket.instances = [];
     Object.defineProperty(document, "fonts", {
       configurable: true,
-      value: { ready: Promise.resolve() },
+      value: {
+        ready: Promise.resolve(),
+        // FontFaceSet is an EventTarget in real browsers; the component
+        // listens for 'loadingdone' to re-fit after webfont swap. Stub the
+        // methods so init doesn't throw.
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      },
     });
     vi.stubGlobal("WebSocket", MockWebSocket);
     vi.stubGlobal(
@@ -117,13 +137,53 @@ describe("DirectTerminal render", () => {
   it("renders the shared accent chrome for orchestrator terminals", async () => {
     render(<DirectTerminal sessionId="ao-orchestrator" variant="orchestrator" />);
 
-    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/runtime/terminal", expect.any(Object)));
     await waitFor(() =>
       expect(screen.getByText("Connected")).toBeInTheDocument(),
     );
 
     expect(screen.getByText("ao-orchestrator")).toHaveStyle({ color: "var(--color-accent)" });
     expect(screen.getByText("XDA")).toHaveStyle({ color: "var(--color-accent)" });
-    expect(MockWebSocket.instances[0]?.url).toContain("/ao-terminal-ws?session=ao-orchestrator");
+  });
+
+  it("keeps restart and fullscreen actions available in chromeless mode", async () => {
+    render(
+      <DirectTerminal
+        sessionId="ao-opencode"
+        chromeless
+        isOpenCodeSession
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Restart OpenCode session" })).toBeInTheDocument(),
+    );
+
+    expect(screen.getByRole("button", { name: "fullscreen" })).toBeInTheDocument();
+    expect(screen.queryByText("XDA")).toBeNull();
+  });
+
+  it("switches the terminal shell between inline and fullscreen positioning", async () => {
+    const { container } = render(<DirectTerminal sessionId="ao-orchestrator" variant="orchestrator" />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "fullscreen" })).toBeInTheDocument(),
+    );
+
+    const terminalShell = container.firstElementChild;
+    expect(terminalShell).not.toBeNull();
+    expect(terminalShell).toHaveClass("relative");
+    expect(terminalShell).not.toHaveClass("fixed");
+
+    fireEvent.click(screen.getByRole("button", { name: "fullscreen" }));
+
+    expect(screen.getByRole("button", { name: "exit fullscreen" })).toBeInTheDocument();
+    expect(terminalShell).toHaveClass("fixed", "inset-0");
+    expect(terminalShell).not.toHaveClass("relative");
+
+    fireEvent.click(screen.getByRole("button", { name: "exit fullscreen" }));
+
+    expect(screen.getByRole("button", { name: "fullscreen" })).toBeInTheDocument();
+    expect(terminalShell).toHaveClass("relative");
+    expect(terminalShell).not.toHaveClass("fixed");
   });
 });

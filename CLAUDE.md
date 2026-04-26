@@ -62,12 +62,12 @@ pnpm dev                                    # Web dashboard (Next.js + 2 WS serv
 
 # Type checking
 pnpm typecheck                              # All packages
-pnpm --filter @composio/ao-web typecheck    # Web only
+pnpm --filter @aoagents/ao-web typecheck    # Web only
 
 # Testing
 pnpm test                                   # All packages (excludes web)
-pnpm --filter @composio/ao-web test         # Web tests
-pnpm --filter @composio/ao-web test:watch   # Web watch mode
+pnpm --filter @aoagents/ao-web test         # Web tests
+pnpm --filter @aoagents/ao-web test:watch   # Web watch mode
 pnpm test:integration                       # Integration tests
 
 # Lint & format
@@ -131,6 +131,66 @@ Hash = SHA-256 of config directory (first 12 chars). Prevents collision across m
 2. Config prompt (project-specific rules from YAML)
 3. Rules files (optional `.agent-rules.md` from repo)
 
+## Working Principles
+
+These behavioral guidelines apply to every agent working on this codebase. They are not optional - they prevent the most common causes of PR rejection and rewrite.
+
+### Think Before Coding
+
+Don't assume. Don't hide confusion. Surface tradeoffs.
+
+- State assumptions explicitly. If uncertain, ask.
+- If multiple interpretations of a task exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+- When editing `lifecycle-manager.ts` or `session-manager.ts`: state which invariants your change preserves. These files have subtle state dependencies.
+
+### Simplicity First
+
+Minimum code that solves the problem. Nothing speculative.
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- Plugin slots are the extension point. Don't add configuration surface when a new plugin is the right answer.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+### Surgical Changes
+
+Touch only what you must. Clean up only your own mess.
+
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If your changes create orphans (unused imports, dead variables), remove them.
+- Don't remove pre-existing dead code unless asked.
+- Every changed line should trace directly to the task description.
+
+This is especially critical in:
+- `types.ts` - changing an interface breaks every plugin. Minimize surface changes.
+- `globals.css` - tokens are consumed across 50+ components. Don't rename casually.
+- `lifecycle-manager.ts` - state transitions have implicit dependencies. Document why a transition is safe.
+
+### Goal-Driven Execution
+
+Define success criteria. Loop until verified.
+
+Transform tasks into verifiable goals:
+- "Add a new status" -> "Add to enum, update `isTerminalSession`, add to dashboard column mapping, write tests for all three"
+- "Fix the bug" -> "Write a test that reproduces it, then make it pass"
+- "Refactor X" -> "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+
+[Step] -> verify: [check]
+[Step] -> verify: [check]
+[Step] -> verify: [check]
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
 ## Conventions
 
 ### Code Style
@@ -159,7 +219,7 @@ Hash = SHA-256 of config directory (first 12 chars). Prevents collision across m
 ### Imports
 
 - `@/` alias -> `packages/web/src/`
-- `@composio/ao-core` for core imports
+- `@aoagents/ao-core` for core imports
 - `workspace:*` for cross-package
 
 ### Web / Styling
@@ -201,7 +261,8 @@ Hash = SHA-256 of config directory (first 12 chars). Prevents collision across m
 | `packages/web/src/components/SessionCard.tsx` | Kanban session card |
 | `packages/web/src/hooks/useSessionEvents.ts` | SSE consumer hook |
 | `packages/web/src/lib/types.ts` | Dashboard types |
-| `packages/web/src/app/globals.css` | Design tokens and base styles |
+| `packages/web/src/app/globals.css` | Design tokens and base styles (full token definitions) |
+| `DESIGN.md` | **Design system reference** — design principles, token mapping, component patterns, anti-patterns (read this before writing any web UI) |
 | `agent-orchestrator.yaml` | Project-level config (user-created) |
 | `eslint.config.js` | ESLint flat config |
 | `tsconfig.base.json` | Shared TypeScript base config |
@@ -212,7 +273,7 @@ Hash = SHA-256 of config directory (first 12 chars). Prevents collision across m
 
 ```
 packages/plugins/{slot}-{name}/
-├── package.json          # @composio/ao-plugin-{slot}-{name}
+├── package.json          # @aoagents/ao-plugin-{slot}-{name}
 ├── tsconfig.json         # extends ../../../tsconfig.base.json
 ├── src/
 │   ├── index.ts          # manifest + create + detect (default export)
@@ -221,7 +282,7 @@ packages/plugins/{slot}-{name}/
 
 ### Naming
 
-- Package: `@composio/ao-plugin-{slot}-{name}` (lowercase, hyphenated)
+- Package: `@aoagents/ao-plugin-{slot}-{name}` (lowercase, hyphenated)
 - `manifest.name` must match the `{name}` suffix (e.g. package `...-runtime-tmux` -> name: `"tmux"`)
 - `manifest.slot` must use `as const` to preserve the literal type
 
@@ -230,7 +291,7 @@ packages/plugins/{slot}-{name}/
 Every plugin default-exports a `PluginModule<T>`:
 
 ```typescript
-import type { PluginModule, Runtime } from "@composio/ao-core";
+import type { PluginModule, Runtime } from "@aoagents/ao-core";
 
 export const manifest = {
   name: "tmux",
@@ -294,7 +355,7 @@ import {
   PREFERRED_GH_PATH,            // /usr/local/bin/gh
   CI_STATUS, ACTIVITY_STATE, SESSION_STATUS,  // Constants
   type Session, type ProjectConfig, type RuntimeHandle,
-} from "@composio/ao-core";
+} from "@aoagents/ao-core";
 ```
 
 ### Testing
@@ -342,7 +403,7 @@ All agent plugins (claude-code, codex, aider, opencode, etc.) must implement the
 **Environment requirements:**
 - All agents must set `AO_SESSION_ID` and optionally `AO_ISSUE_ID`
 - All agents using PATH wrappers must prepend `~/.ao/bin` to PATH
-- Use `normalizeAgentPermissionMode` from `@composio/ao-core` (not a local duplicate)
+- Use `normalizeAgentPermissionMode` from `@aoagents/ao-core` (not a local duplicate)
 
 **Activity detection architecture:**
 

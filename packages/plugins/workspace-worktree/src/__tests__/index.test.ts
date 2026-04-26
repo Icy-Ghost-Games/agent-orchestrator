@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import type { ProjectConfig, WorkspaceCreateConfig, WorkspaceInfo } from "@composio/ao-core";
+import type { ProjectConfig, WorkspaceCreateConfig, WorkspaceInfo } from "@aoagents/ao-core";
 
 // ---------------------------------------------------------------------------
 // Mocks — must be declared before any import that uses the mocked modules
@@ -203,6 +203,44 @@ describe("workspace.create()", () => {
     expect(mockMkdirSync).toHaveBeenCalledWith("/mock-home/.worktrees/myproject", {
       recursive: true,
     });
+  });
+
+  it("removes a stale unregistered worktree directory before creating a new worktree", async () => {
+    const ws = create();
+
+    mockExistsSync.mockReturnValueOnce(true);
+    mockGitSuccess(""); // git worktree prune
+    mockGitSuccess("worktree /repo/path\nHEAD deadbeef\nbranch refs/heads/main"); // git worktree list --porcelain
+    mockOriginRemote();
+    mockGitSuccess(""); // git rev-parse --verify --quiet origin/main
+    mockGitSuccess(""); // worktree add
+
+    await ws.create(makeCreateConfig());
+
+    expect(mockRmSync).toHaveBeenCalledWith("/mock-home/.worktrees/myproject/session-1", {
+      recursive: true,
+      force: true,
+    });
+
+    expect(mockExecFileAsync).toHaveBeenCalledWith(
+      "git",
+      ["worktree", "add", "-b", "feat/TEST-1", "/mock-home/.worktrees/myproject/session-1", "origin/main"],
+      { cwd: "/repo/path" },
+    );
+  });
+
+  it("throws a useful error when the existing worktree path is still registered with git", async () => {
+    const ws = create();
+
+    mockExistsSync.mockReturnValueOnce(true);
+    mockGitSuccess(""); // git worktree prune
+    mockGitSuccess(
+      "worktree /mock-home/.worktrees/myproject/session-1\nHEAD deadbeef\nbranch refs/heads/feat/TEST-1",
+    ); // git worktree list --porcelain
+
+    await expect(ws.create(makeCreateConfig())).rejects.toThrow(
+      'Worktree path "/mock-home/.worktrees/myproject/session-1" already exists and is still registered with git',
+    );
   });
 
   it("continues when fetch fails (offline)", async () => {
